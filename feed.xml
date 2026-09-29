@@ -1,0 +1,1514 @@
+<?xml version="1.0" encoding="utf-8"?><feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><generator uri="https://jekyllrb.com/" version="4.4.1">Jekyll</generator><link href="https://wai-org.com/draft/feed.xml" rel="self" type="application/atom+xml" /><link href="https://wai-org.com/draft/" rel="alternate" type="text/html" hreflang="en" /><updated>2026-09-29T15:58:39-07:00</updated><id>https://wai-org.com/draft/feed.xml</id><title type="html">WAI</title><subtitle>WAI is a student-led organization formed by AI PhD students from the University of Washington, working on open agentic research across the full stack — data, training, and evaluation.</subtitle><author><name>WAI</name></author><entry><title type="html">Context Language Models</title><link href="https://wai-org.com/draft/blog/clm/" rel="alternate" type="text/html" title="Context Language Models" /><published>2026-09-28T00:00:00-07:00</published><updated>2026-09-28T00:00:00-07:00</updated><id>https://wai-org.com/draft/blog/context-language-models</id><content type="html" xml:base="https://wai-org.com/draft/blog/clm/"><![CDATA[<div class="post-hero">
+<h1 class="title">
+Context Language Models
+</h1>
+<div class="byline">
+<p>Rulin Shao, Shannon Zejiang Shen, Junjie Oscar Yin, Yuetai Li,
+Minheng Wang, Hamish Ivison, Radha Poovendran, Nathan Lambert, Teng
+Xiao, Mike Lewis, Wen-tau Yih, Luke Zettlemoyer, Pang Wei Koh</p>
+</div>
+<div class="affiliations">
+<p>University of Washington · Meta Superintelligence Labs · MIT ·
+Trillium Labs</p>
+</div>
+<div class="post-date">
+<p>September 28, 2026</p>
+</div>
+</div>
+<div class="draft-note">
+<p>Before publishing: confirm author formatting (the TMax post bolds
+co-first authors; the paper marks none), the publication date, and the
+missing links in the resources line (arXiv, tweet). Draft notes like
+this one only show up in local builds; production builds hide them.</p>
+</div>
+<figure>
+<img src="/draft/assets/img/clm/teaser.png"
+alt="Context Language Models natively manage their own context by treating context as a file. (A) Qualitative examples of context-management behaviors introduced by CLMs. (B) Out of the box, CLMs improve performance at lower cost on BrowseComp-Plus and on Software World, where an agent swarm jointly optimizes six repositories. (C) CLMs follow textual instructions to adopt a context-management strategy, and evolve better strategies through a skill-evolution loop. (D) CLMs explore and internalize context-management strategies through online reinforcement learning." />
+<figcaption aria-hidden="true">Context Language Models natively manage
+their own context by treating context as a file. (A) Qualitative
+examples of context-management behaviors introduced by CLMs. (B) Out of
+the box, CLMs improve performance at lower cost on BrowseComp-Plus and
+on Software World, where an agent swarm jointly optimizes six
+repositories. (C) CLMs follow textual instructions to adopt a
+context-management strategy, and evolve better strategies through a
+skill-evolution loop. (D) CLMs explore and internalize
+context-management strategies through online reinforcement
+learning.</figcaption>
+</figure>
+<div class="tldr">
+<p><span class="tldr-label">TL;DR</span></p>
+<p><strong>Context Language Models (CLMs)</strong> are language models
+that manage their own context. Instead of a harness deciding what to
+keep, summarize, or throw away, the model can rewrite its context
+however it wants. We implement this in the simplest way we could think
+of: <strong>the context is a file</strong>, and the model edits it with
+Bash like any other file.</p>
+<p>Built zero-shot from existing models, <strong>CLMs outperform
+state-of-the-art context-management strategies</strong> on tasks that
+run from minutes to more than a day. With Qwen3.6-27B at a 32K context
+limit, CLM scores 59.4% on BrowseComp-Plus against 53.3% for the best
+baseline, while using 21.5% less compute. It also comes out ahead on
+12-hour repository optimization, with 59% less compute, and in a
+24-hour, six-repository agent swarm. Because context management is now
+an intrinsic model behavior, <strong>CLMs enable both in-context and
+parametric learning</strong>. We show that CLMs can be steered with
+natural-language instructions and, through a standard skill-optimization
+loop, improve held-out accuracy on a context-management task by up to
+35.9 points. We also introduce an online reinforcement learning method
+for CLMs, improving Qwen3.5-9B performance on BrowseComp-Plus by 47.6%
+while using 12% fewer FLOPs. Finally, we co-design <em>Suffix Cache
+Reuse</em> for CLM serving, cutting server-side compute by 35% at the
+same accuracy.</p>
+<p><strong>Resources:</strong> <a href="#">📄 Paper</a> · <a
+href="https://github.com/facebookresearch/context-language-models">👨‍💻
+GitHub</a> · <a href="#">🐦 Tweet</a></p>
+</div>
+<p>This post gives a casual walkthrough of Context Language Models,
+highlighting the ideas and results we find most interesting. For a more
+detailed and technical dive, please see the paper and the code.</p>
+<h2 id="context-management-is-still-hand-designed">1. Context management
+is still hand-designed</h2>
+<p>Everything a language model knows about the task in front of it lives
+in its context. For a short chat, that’s fine. But agents now run for
+hours: they read files, run searches, try ideas, and generate far more
+tokens than any context window can hold. Something has to decide what
+stays in the context and what goes.</p>
+<p>Today, that something is usually the harness, not the model. A
+typical agent harness appends every action and observation to the
+context, and when the context reaches a fixed threshold (say, 75% of the
+window), it asks the model to summarize everything and continues from
+the summary. A person wrote that rule, and it is the same for every
+task.<span
+class="sidenote-wrapper"><label for="sn-0" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-0" class="margin-toggle"/><span
+class="sidenote">Examples include Cursor, Codex, and Terminus 2, which
+compact once the context reaches a predefined length. MEM1 (Zhou et al.,
+2026) instead updates the context at every turn, but that schedule is
+also fixed by the harness.<br />
+<br />
+</span></span></p>
+<p>Recent work has started to hand some of this control to the model.
+Some methods let the model decide <em>when</em> to compact.<span
+class="sidenote-wrapper"><label for="sn-1" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-1" class="margin-toggle"/><span
+class="sidenote">AutoCompact (Zhang et al., 2026) and Self-Compact (Li
+et al., 2026).<br />
+<br />
+</span></span> Others let it compact a chosen part of its context,
+offload content to storage and retrieve it later, or pick which
+fragments of the context to operate on.<span
+class="sidenote-wrapper"><label for="sn-2" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-2" class="margin-toggle"/><span
+class="sidenote">Context-as-a-Tool (Liu et al., 2026), ACM (Li et al.,
+2026), and Sculptor (Li et al., 2026).<br />
+<br />
+</span></span> Each step gives the model more autonomy, but always
+within a small menu of actions that people designed in advance.</p>
+<p>We wanted to see what happens if we drop the menu and give the model
+full control over its own context. The bet follows the Bitter
+Lesson:<span
+class="sidenote-wrapper"><label for="sn-3" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-3" class="margin-toggle"/><span
+class="sidenote">Sutton, “The Bitter Lesson,” 2019.<br />
+<br />
+</span></span> rather than hand-designing context-management strategies,
+let models search for and learn their own. It turns out that existing
+models already do this well without any training, matching or
+outperforming hand-designed strategies across a range of tasks.</p>
+<h2 id="context-language-models">2. Context Language Models</h2>
+<p>A standard language model treats its context as append-only. At each
+step it generates something new, <span
+class="math inline">f^{\mathrm{LM}}_\theta(c_t)</span>, and that gets
+added to the end:</p>
+<p><span class="math display">c_{t+1} = c_t \oplus
+f^{\mathrm{LM}}_\theta(c_t)</span></p>
+<p>A <strong>Context Language Model (CLM)</strong> instead produces its
+entire next context:</p>
+<p><span class="math display">c_{t+1} =
+f^{\mathrm{CLM}}_\theta(c_t)</span></p>
+<p>Here <span class="math inline">f^{\mathrm{CLM}}_\theta</span> can be
+any transformation the model chooses: delete a stale search result,
+rewrite a plan, move a large block to disk, or simply append as usual. A
+fixed menu of context-management tools is a special case of this. The
+difference is that nobody has to define those tools in advance. A CLM
+can come up with its own, either implicitly as part of its plan or
+explicitly as a reusable function (we’ll see one in Section 4).</p>
+<h3 id="context-as-a-file">Context as a file</h3>
+<p>How do you let a model rewrite its own context without inventing a
+new interface for it? We use one it already knows well: files. The
+model’s live context is mirrored to a file, and the system prompt tells
+the model where that file is. The model edits it with ordinary Bash,
+exactly as it would edit any other file. Edits are synchronized back
+into the model’s live context before the next model call. If the model
+leaves the file alone, new tokens are appended as usual, so nothing
+changes unless the model decides it should.</p>
+<p>We deliberately keep everything else minimal. In most experiments the
+agent runs on Mini-SWE-Agent, a harness with a minimal Bash interface,
+and even task tools such as search are provided as in-context skills
+rather than hard-coded into the harness, so they can be added or revised
+without retraining.<span
+class="sidenote-wrapper"><label for="sn-4" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-4" class="margin-toggle"/><span
+class="sidenote">The closest idea we know of is Recursive Language
+Models (Zhang et al., 2025), which place a long input in a REPL variable
+that the model can access programmatically. That gives the model control
+over how it reads the input, but its own live context stays read-only.
+CLMs make the live context itself editable; the two approaches are
+complementary.<br />
+<br />
+</span></span></p>
+<h3 id="multi-agent-clms">Multi-agent CLMs</h3>
+<p>Because each context is just a file, multiple agents come almost for
+free. An agent swarm is a workspace that starts with several context
+files, each kept in sync with its own model server. A subagent is
+spawned by creating a new context file and shut down by deleting it. We
+use both in the long-running experiments in Section 4.</p>
+<h2 id="contextbench-testing-context-management-in-isolation">3.
+ContextBench: testing context management in isolation</h2>
+<p>On a real agent benchmark, context management is tangled up with
+reasoning and knowledge. If an agent gets a deep-research question
+wrong, was it the search, the reasoning, or something it forgot? To see
+more directly where context-management strategies break, we built
+<strong>ContextBench</strong>, four synthetic tasks in which managing
+the context is the only thing that matters.</p>
+<div class="task-row">
+<figure>
+<img src="/draft/assets/img/clm/task-needle-retention.png"
+alt="Needle Retention keep needle lines verbatim" />
+<figcaption aria-hidden="true"><strong>Needle Retention</strong><br>keep
+needle lines verbatim</figcaption>
+</figure>
+<figure>
+<img src="/draft/assets/img/clm/task-sudoku-sketchpad.png"
+alt="Sudoku Sketchpad edit a board in place" />
+<figcaption aria-hidden="true"><strong>Sudoku Sketchpad</strong><br>edit
+a board in place</figcaption>
+</figure>
+<figure>
+<img src="/draft/assets/img/clm/task-kv-store.png"
+alt="KV Store offload values, look them up" />
+<figcaption aria-hidden="true"><strong>KV Store</strong><br>offload
+values, look them up</figcaption>
+</figure>
+<figure>
+<img src="/draft/assets/img/clm/task-log-triage.png"
+alt="Log Triage offload logs, answer queries" />
+<figcaption aria-hidden="true"><strong>Log Triage</strong><br>offload
+logs, answer queries</figcaption>
+</figure>
+</div>
+<p>Each task streams its input into the agent’s context one message at a
+time: 4K-token document chunks with a few needle lines buried in filler,
+moves on a 16×16 Sudoku board, batches of 100 key-value writes followed
+by lookups, or batches of service logs followed by questions. The
+agent’s only control over the stream is when to ask for the next
+message. Nothing requires search or reasoning beyond following
+instructions, so an agent that could keep everything in context would
+score 100%. Answers are graded from the agent’s context; an answer that
+only exists in a file on disk doesn’t count.</p>
+<p>We fix the context limit at 32K tokens and turn up the
+<strong>context pressure</strong>, the total input divided by the
+context limit, to as much as 24×. We compare CLM against the base
+harness with no context management, Codex-style summarization (which we
+call Summary below), Context Folding, RLM, Self-Compact, and ACM. So
+that the comparison is about each strategy rather than about whether the
+model understood its tools, every method gets a detailed skill document
+explaining how to use its own mechanism on each task.<span
+class="sidenote-wrapper"><label for="sn-5" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-5" class="margin-toggle"/><span
+class="sidenote">We wrote each method’s skill to a level of detail
+comparable to the CLM skill. The skills are released with the
+benchmark.<br />
+<br />
+</span></span></p>
+<div class="clm-chart" data-chart="contextbench">
+<p><strong>ContextBench with GPT-5.4 at a 32K context limit.</strong>
+Accuracy against context pressure. Hover over a point for exact values,
+click a method in the legend to hide it, or double-click to show it
+alone.</p>
+</div>
+<p>The fixed strategies can’t adapt to the live context, and none of the
+existing methods performs perfectly, even on these simple tasks. Each
+fails in a different way:</p>
+<ul>
+<li><strong>Summaries lose exact content.</strong> Summary-based
+compaction can lose or hallucinate information on Needle Retention and
+Sudoku Sketchpad.</li>
+<li><strong>Append-only methods can’t make small edits.</strong> Methods
+without flexible in-place editing must regenerate the full Sudoku state
+for every fine-grained edit.</li>
+<li><strong>Offloading isn’t the same as forgetting.</strong> Standard
+coding tools can offload information on KV Store and Log Triage, but
+they can’t evict it from the live context on demand.</li>
+</ul>
+<p>These failures are what motivate fully adaptive, model-controlled
+context management.</p>
+<h2 id="clms-out-of-the-box">4. CLMs out of the box</h2>
+<p>Everything in this section uses existing models without any training;
+the only thing we change is how the context is managed.</p>
+<h3 id="emergent-context-management-behaviors">Emergent
+context-management behaviors</h3>
+<p>Here is what models actually do once they can edit their own context.
+Some of these behaviors are new; others reproduce effective compaction
+behaviors familiar from existing harnesses.</p>
+<div class="clm-tabs clm-examples">
+<div class="tab" data-tab="Subagent scoreboard">
+<p>To orchestrate and monitor subagents, the CLM builds scoreboards and
+trackers inside its context and keeps them current with in-place edits.
+In one run it updated agent status through 163 in-place edits while
+keeping its context at only 6–8K tokens.</p>
+<pre class="clm-edit"><code><span class="sc">open(p, "w").write("""[[CTX_TURN 1 role=assistant]]</span>
+## STATE — Erdős Minimum Overlap Problem (compact)
+<span class="hl">LEDGER TOP:</span> 0.9992491 ...
+<span class="hl">AGENTS:</span> 21 launched, 5 currently running ...
+<span class="hl">KEY FILES:</span> /workspace/subctx_4/h_best_final.npy ...
+<span class="hl">FINDINGS:</span> All methods plateau at 0.381157 ...<span class="sc">""")</span></code></pre>
+<pre class="clm-edit"><code><span class="sc">new = """</span><span class="hl">## ORCHESTRATOR STATE (compact)</span>
+<span class="hl">Budget:</span> 7/100 used. All 5 slots BUSY (subctx_0..4 ...
+<span class="hl">Dead ends:</span> simple grid(0.822), hexagonal(0.9977) ...
+<span class="hl">Next:</span> score my own candidates while workers run ...<span class="sc">"""</span></code></pre>
+<p><span class="tab-source">Erdős minimum overlap, step 455; circle
+packing, steps 194 and 198</span></p>
+</div>
+<div class="tab" data-tab="A new role for notes">
+<p>When rewriting old turns, the CLM created a new role alongside the
+chat template’s roles, <code>notes</code>, to mark information it wrote
+for its own internal use.</p>
+<pre class="clm-edit"><code><span class="sc">re.sub(r"</span><span class="rm">\[\[CTX_TURN 4 .*?(?=\[\[CTX_TURN 16)</span><span class="sc">",</span>
+<span class="sc">       """[[CTX_TURN 4 </span><span class="hl">role=notes</span><span class="sc">]]</span>
+STATUS: ... James Gallagher (docid=58939) ...<span class="sc">""")</span></code></pre>
+<p><span class="tab-source">BrowseComp-Plus, step 40</span></p>
+</div>
+<div class="tab" data-tab="Loops that prune results">
+<p>The CLM writes loops over its own turns: here it replaces past
+searches that found nothing with a one-line marker, and in another run
+it compacts overly long tool outputs into short references.</p>
+<pre class="clm-edit"><code><span class="hl">for t in turns[1:]:</span> <span class="sc">...</span>
+<span class="sc">    result += f'\n[[CTX_TURN search]]\n</span><span class="hl">Searched: {m.group(1).strip()}.</span> <span class="hl">No relevant results.</span><span class="sc">\n'</span></code></pre>
+<pre class="clm-edit"><code><span class="hl">while i &lt; len(lines):</span> <span class="sc">...</span>
+<span class="sc">    if </span><span class="hl">len(body) &gt; 500</span><span class="sc">: ...</span>
+<span class="sc">        if </span>'bcp_search' in body<span class="sc">: ...</span>
+<span class="sc">            result.append(f"</span><span class="hl">[Searched: {query}]</span><span class="sc">")</span>
+<span class="sc">        elif </span>'bcp_get_document' in body<span class="sc">: ...</span>
+<span class="sc">            result.append(f"</span><span class="hl">[Retrieved doc {docid}]</span><span class="sc">")</span>
+<span class="sc">    else:</span>
+<span class="sc">        result.extend(body_lines)</span></code></pre>
+<p><span class="tab-source">BrowseComp-Plus, steps 1509 and
+13</span></p>
+</div>
+<div class="tab" data-tab="A reusable helper">
+<p>The CLM defines its own compaction function, which keeps a progress
+note and replaces old search results with a pointer to that note. It
+invoked <code>compact_turns</code> 37 times in one run.</p>
+<pre class="clm-edit"><code><span class="sc">progress = """</span>[Search progress: VERIFIED ... NEXT: ...]<span class="sc">"""</span>
+<span class="sc">s = re.sub(..., </span><span class="hl">progress</span><span class="sc">, s)</span>
+
+<span class="hl">def compact_turns(text):</span>
+<span class="sc">    return re.sub(..., lambda m: </span>m.group(0).split('\n')[0]
+<span class="sc">        + '\n</span><span class="hl">[search results - see progress note]</span><span class="sc">', text)</span>
+<span class="hl">s = compact_turns(s)</span></code></pre>
+<p><span class="tab-source">BrowseComp-Plus, step 109</span></p>
+</div>
+<div class="tab" data-tab="Summaries that keep what matters">
+<p>The CLM also reproduces effective behaviors from existing baselines.
+It compresses 21K tokens into a summary that keeps the facts needed for
+the answer, and it summarizes finished experiments while keeping a list
+of untried ideas for later.</p>
+<pre class="clm-edit"><code><span class="sc">re.sub(r"</span><span class="rm">\[\[CTX_TURN 2.*</span><span class="sc">",</span>
+<span class="sc">  "</span>[SUMMARY: ... <span class="hl">Kader Asmal Excellence Award</span>
+   <span class="hl">launched 2011 by Mrs A Motshekga</span> ...]<span class="sc">")</span></code></pre>
+<pre class="clm-edit"><code><span class="sc">new = """</span>[EXPLORATION LEDGER - <span class="hl">86 scored attempts</span> ...
+Best score: 0.9931 (sum_radii=2.6177) from ...
+<span class="hl">UNTRIED IDEAS (priority order):</span>
+<span class="hl">1.</span> Gradient clipping norm=1.0 with 12k steps
+<span class="hl">2.</span> Try lam=2200+uniform(0,2800) with 12k steps ...<span class="sc">"""</span></code></pre>
+<p><span class="tab-source">BrowseComp-Plus, step 20; circle packing,
+step 332</span></p>
+</div>
+<div class="edit-legend">
+<p><span class="hl">new text the CLM writes into its context</span>
+<span class="rm">context the edit deletes</span> <span class="sc">code
+around the edit</span></p>
+</div>
+<p><strong>Qualitative examples of CLM context-management
+behaviors.</strong> Each tab shows a real edit command from our runs,
+shortened where marked with <code>...</code>. The highlighted span is
+what each example is about, usually the new text the CLM writes into its
+next context.</p>
+</div>
+<h3 id="measuring-cost-when-the-context-changes">Measuring cost when the
+context changes</h3>
+<p>Model servers such as vLLM and SGLang cache the internal (key-value)
+states of each request and reuse them when the next request starts with
+the same tokens. An agent that only appends gets almost its whole
+history from this cache. Once the agent edits something in the middle of
+its context, though, every token after the edit has to be processed
+again, even the text that didn’t change.</p>
+<p>So we measure cost in <strong>prefix-reuse FLOPs</strong>: the FLOPs
+to process every prompt token from the first mismatch with the cached
+prefix onward, plus the FLOPs to generate new tokens. This charges CLMs
+for every edit they make.<span
+class="sidenote-wrapper"><label for="sn-6" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-6" class="margin-toggle"/><span
+class="sidenote">For a sense of scale, take one Qwen3.6-27B turn with a
+20K-token prompt and a 500-token response. With prefix caching, an
+append-only turn costs 1.4 × 10¹⁴ FLOPs. An edit in the middle of the
+context raises that to 5.7 × 10¹⁴, and an edit at the very start to 10.8
+× 10¹⁴, 7.7 times the append-only turn.<br />
+<br />
+</span></span> All the accuracy-versus-cost plots below use this
+metric.</p>
+<h3 id="coding-and-deep-research">Coding and deep research</h3>
+<p>We start with two terminal-coding benchmarks, TerminalBench 2.1 and
+TBLite, and the deep-research benchmark BrowseComp-Plus. Every method
+runs on the same Mini-SWE-Agent backbone with a 32K context limit, and
+all are evaluated out of the box. Besides the base harness and Summary,
+we compare against MEM1, Self-Compact, ACM, and RLM.</p>
+<div class="clm-chart" data-chart="pareto">
+<p><strong>Accuracy against inference cost on coding and deep research,
+at a 32K context limit.</strong> Each point is one context-management
+method, and the dashed line marks the Pareto frontier. Cost is
+prefix-reuse PFLOPs per question. Use the buttons to switch between
+Qwen3.6-27B and the smaller Qwen3.5-9B.</p>
+</div>
+<p>With Qwen3.6-27B, CLM is on the Pareto frontier on all three
+benchmarks:</p>
+<ul>
+<li><strong>BrowseComp-Plus:</strong> 59.4% against 53.3% for Summary,
+the strongest baseline, while using 21.5% less compute than Summary and
+28.9% less than MEM1.</li>
+<li><strong>TerminalBench 2.1:</strong> matches Summary at 53.4% while
+using only 70% of its compute.</li>
+<li><strong>TBLite:</strong> 73.7% against 67.0%, using 91% of Summary’s
+compute.</li>
+</ul>
+<p>CLM leaves the decision of when and how to edit the context to the
+model, so its gains grow with the model’s ability to make that decision.
+With Qwen3.5-9B, CLM still reaches 39.9% on BrowseComp-Plus, above
+Summary (37.7%), but the smaller model edits its context less often. On
+TerminalBench 2.1, Qwen3.5-9B edits its context 1.4 times per task on
+average and makes no edit in half of the tasks, while Qwen3.6-27B edits
+2.6 times per task. The median peak context is correspondingly higher
+for Qwen3.5-9B: 30.2K tokens of the 32K limit, against 17.6K for
+Qwen3.6-27B.</p>
+<h3
+id="long-horizon-discovery-math-repositories-and-agent-swarms">Long-horizon
+discovery: math, repositories, and agent swarms</h3>
+<p>Context management matters most when tasks run long. We look at three
+open-ended settings, running from hours to more than a day.</p>
+<p><strong>Math optimization (up to 5 hours).</strong> We take four open
+problems popularized by AlphaEvolve: circle packing, the
+min-max/min-distance ratio, Erdős minimum overlap, and the Heilbronn
+triangle problem. The main baseline is OpenEvolve, a specialized
+AlphaEvolve-style workflow for program generation, evaluation, and
+evolutionary selection. We also run OpenEvolve-Agent, which replaces
+OpenEvolve’s proposer with a Mini-SWE-Agent that can interact with the
+environment before each submission. The CLM gets the same minimal Bash
+harness as everywhere else, with the evolutionary algorithm provided as
+in-context guidance; planning and context management are left to the
+agent. Every method uses Claude 4.6 Sonnet, the same evaluator, and a
+32K context limit, and stops after 100 scored attempts or 5 hours.</p>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Method</th>
+<th>Circle packing ↑</th>
+<th>Heilbronn ↑</th>
+<th>Min-max/min-dist ↑</th>
+<th>Erdős overlap ↓</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>OpenEvolve</td>
+<td>2.541</td>
+<td>0.03127</td>
+<td>0.07690</td>
+<td>0.38123</td>
+</tr>
+<tr class="even">
+<td>OpenEvolve-Agent</td>
+<td>2.525</td>
+<td>0.03053</td>
+<td>0.07724</td>
+<td>0.38167</td>
+</tr>
+<tr class="odd">
+<td><strong>CLM</strong></td>
+<td>2.618</td>
+<td><strong>0.03653</strong></td>
+<td><strong>0.07758</strong></td>
+<td><strong>0.38094</strong></td>
+</tr>
+<tr class="even">
+<td><strong>CLMs (subagents)</strong></td>
+<td><strong>2.636</strong></td>
+<td>0.03617</td>
+<td>0.07758</td>
+<td>0.38109</td>
+</tr>
+</tbody>
+</table>
+<p><em>Best-of-run scores with Claude 4.6 Sonnet and a 32K context
+limit.</em></p>
+<div class="clm-chart" data-chart="open_problems">
+<p><strong>Best score so far against scored attempts on the four
+problems.</strong> Lines show the best score so far and dots individual
+scored candidates. “Zoom to the top” frames the final-score range, like
+the insets in the paper’s figure.</p>
+</div>
+<p>CLM achieves the highest best-of-run score on all four problems,
+including improvements over OpenEvolve of 16.8% on the Heilbronn
+triangle problem and 3.0% on circle packing. A general agent with direct
+control over its context outperforms a specialized evolutionary
+workflow, with less fixed orchestration.</p>
+<p><strong>Single-repository optimization (12 hours).</strong>
+EdgeBench-10 is a fixed set of ten EdgeBench tasks in which the agent
+optimizes a repository for up to 12 hours, with verifier feedback on its
+submissions. We compare the base harness, Summary, CLM, and CLM with up
+to five concurrent subagents, all with a 32K context budget, and report
+the best score over three seeds per task.<span
+class="sidenote-wrapper"><label for="sn-7" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-7" class="margin-toggle"/><span
+class="sidenote">When a request would exceed the context budget, the
+harness rolls back the last turn and lets the agent continue, up to 50
+times.<br />
+<br />
+</span></span></p>
+<div class="clm-chart" data-chart="edgebench">
+<p><strong>Twelve-hour repository optimization on EdgeBench-10.</strong>
+Curves show best-of-three scores over 12 hours. End labels give final
+scores and, for Qwen3.6-27B, mean compute per trial (PF = prefix-reuse
+PFLOPs). The 128K view repeats the Qwen3.6-27B comparison with a 128K
+context budget.</p>
+</div>
+<p>With Qwen3.6-27B, CLM reaches 44.6 using 179 PFLOPs per trial,
+against 42.3 and 437 PFLOPs for Summary, which means 59% less compute.
+The subagent variant reaches 44.2 at 181 PFLOPs, so subagents provide
+little additional benefit on this single-repository benchmark. With
+Claude 4.6 Sonnet, CLM and its subagent variant reach 51.0 and 50.4,
+against 42.3 for Summary. With a 128K budget, the three methods that
+manage context keep improving over the twelve hours, while the base
+harness stops improving within the first two hours; CLM with subagents
+reaches 50.2, against 47.3 for CLM and 47.8 for Summary, using 219, 142,
+and 222 PFLOPs per trial.</p>
+<p><strong>Multi-repository optimization with agent swarms (24+
+hours).</strong> Software World scales this up to an agent swarm. Six
+agents, one per Python repository (<code>requests</code>,
+<code>urllib3</code>, and four downstream packages), work in parallel
+for more than 24 hours to make their repositories faster. We score the
+result on 17 held-out CPU benchmarks from four downstream packages that
+the agents never see, measuring speedup in executed instructions; a
+benchmark that breaks counts as no speedup. All agents use GPT-5.6-Sol
+in the Pi agent harness with its default 272K context. We compare a
+swarm of CLMs against a swarm that uses summary compaction.</p>
+<div class="clm-chart" data-chart="software_world">
+<p><strong>Twenty-four-hour agent swarm on Software World.</strong>
+Geometric-mean speedup on the 17 held-out benchmarks against active
+hours, for the CLM swarm and the summary swarm.</p>
+</div>
+<p>The CLM swarm reaches a 1.044× speedup on the held-out benchmarks,
+against 1.026× for the summary swarm, which the paper reports as a 65%
+greater downstream speedup at the same spend. Because the benchmarks
+come from packages the agents never see, this is an extrinsic test of
+whether their improvements transfer beyond the repositories they work on
+directly.</p>
+<h2 id="learning-in-context">5. Learning in context</h2>
+<p>CLMs make context management an intrinsic model behavior, so it can
+be learned like any other skill. The simplest way to change it is to
+tell the model what you want.</p>
+<h3 id="steering-with-a-single-sentence">Steering with a single
+sentence</h3>
+<p>We ran Claude 4.6 Sonnet as a CLM on BrowseComp-Plus and appended a
+single sentence to the task prompt, then compared against the same
+questions without it. Nothing else changes: not the harness, not the
+model.</p>
+<div class="clm-chart" data-chart="steering">
+<p><strong>One sentence in the prompt changes the context-management
+strategy.</strong> Pick a sentence to see its effect; grey is the same
+questions without the instruction. Threshold: the median context size at
+the first compaction, with bootstrap confidence intervals. Boundaries:
+the share of sub-question boundaries followed by a compaction at each
+turn offset, over sessions of four chained questions. Backup: the share
+of context edits preceded by a copy of the context on disk.</p>
+</div>
+<ul>
+<li><strong>“Compact once you reach Y tokens.”</strong> The first
+compaction lands close to the requested threshold: at 16.0K, 23.6K, and
+30.9K tokens for thresholds of 16K, 24K, and 32K.</li>
+<li><strong>“Compact at sub-question boundaries.”</strong> 88% of
+boundaries are followed by a compaction within two turns, against 40%
+without the instruction.</li>
+<li><strong>“Back up before you compact.”</strong> 68% of edits are
+preceded by a full backup and another 9% by a partial one. Without the
+instruction, none are.</li>
+</ul>
+<h3 id="evolving-a-context-management-skill">Evolving a
+context-management skill</h3>
+<p>CLMs can also improve their context-management strategy through
+textual evolution. We write the strategy down as an in-context skill
+document and optimize it with a standard prompt-evolution loop:<span
+class="sidenote-wrapper"><label for="sn-8" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-8" class="margin-toggle"/><span
+class="sidenote">Following GEPA (Agrawal et al., 2026).<br />
+<br />
+</span></span> the agent produces rollouts on a training split, a
+proposer model uses the traces to write candidate skills, and the
+candidates are scored on a development split to decide what to keep.
+Once the search is frozen, we evaluate the selected skill once on a
+held-out test split. We run two settings on ContextBench at a 32K
+limit:</p>
+<ul>
+<li><strong>Assisted evolution:</strong> Qwen3.6-27B is the agent and
+starts with no context-management instruction; Claude Fable 5.1 proposes
+skills.</li>
+<li><strong>Self-evolution:</strong> Opus 5 is both the agent and the
+proposer.</li>
+</ul>
+<div class="clm-chart" data-chart="selfevo">
+<p><strong>Evolving context-management skills on ContextBench.</strong>
+Each point is a skill that improved the Pareto frontier when it was
+proposed (darker means later), gold outlines mark the final frontier,
+and the hollow circle is the starting point with no instruction.
+Accuracy is on the development split used for selection. Drag the slider
+to replay the search.</p>
+</div>
+<p>On KV Store, assisted evolution takes Qwen3.6-27B from 22.3% to 83.8%
+on the development split while lowering compute. On the held-out test
+split, the selected skill raises accuracy from 38.3% to 74.2%, a gain of
+35.9 points. On Log Triage, where Qwen3.6-27B with no instruction
+answers nothing correctly, the selected skill reaches 100%. Opus 5
+already starts between 94% and 100%, and self-evolution still finds
+skills that either reduce cost at the same or higher accuracy, or raise
+accuracy further.</p>
+<h2 id="learning-in-weights">6. Learning in weights</h2>
+<p>Before training, CLM with Qwen3.5-9B scores 28.8% on BrowseComp-Plus,
+six points behind the summary harness (34.7%), because of the smaller
+model’s limited context-management capabilities. So we trained it. That
+raised two design questions.</p>
+<p><strong>Which model calls get credit?</strong> A CLM trajectory
+consists of many model calls, and because the context gets edited, each
+call sees a different input rather than one ever-growing sequence. We
+use stepwise GRPO: for each prompt we sample a group of complete
+trajectories, compute the usual GRPO advantage from each trajectory’s
+final outcome, and apply that advantage to every model call in the
+trajectory.</p>
+<p><strong>How do we reward efficiency without inviting reward
+hacking?</strong> The outcome reward alone says little about editing,
+since successful trajectories can contain wasteful edits and failed ones
+can contain useful edits. Rewarding edits or deleted tokens directly is
+worse: the model learns to make unnecessary edits that throw away
+important information or hurt prefix reuse. So we use a
+<strong>success-gated efficiency advantage</strong>. Among the
+successful trajectories in a group, those cheaper than the group’s
+successful average (in prefix-reuse FLOPs) get a bonus, and more
+expensive ones get a penalty. Failed trajectories get nothing, and
+neither does any group with fewer than two successes:</p>
+<p><span class="math display">A_i = A_i^{\text{out}} + w_{\text{eff}}\,
+A_i^{\text{eff}}, \qquad A_i^{\text{eff}} =
+\operatorname{clip}\!\left(\frac{\bar c_g - c_i}{\bar c_g},\, -1,\,
+1\right) \text{ if trajectory } i \text{ succeeded, else } 0</span></p>
+<p>Here <span class="math inline">c_i</span> is the trajectory’s
+prefix-reuse FLOPs, <span class="math inline">\bar c_g</span> is the
+mean over the successful trajectories in its group, and we set <span
+class="math inline">w_{\text{eff}} = 0.25</span>. We train on 3,040
+deep-research prompts from OpenResearcher and evaluate on
+BrowseComp-Plus, which is held out.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Harness</th>
+<th>BrowseComp-Plus accuracy (%)</th>
+<th>PFLOPs / question</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Summary</td>
+<td>34.7 → 42.1</td>
+<td>4.01 → 2.19</td>
+</tr>
+<tr class="even">
+<td><strong>CLM</strong></td>
+<td>28.8 → <strong>42.5</strong></td>
+<td>1.52 → <strong>1.34</strong></td>
+</tr>
+</tbody>
+</table>
+<p><em>Qwen3.5-9B before and after RL on OpenResearcher, evaluated on
+BrowseComp-Plus. The checkpoint is selected on held-out OpenResearcher
+questions.</em></p>
+<p>RL adds 13.7 points to CLM, which ends up matching the trained
+summary harness while using 39% less compute per question.</p>
+<div class="clm-chart" data-chart="rl">
+<p><strong>RL training curves through step 70.</strong> Qwen3.5-9B
+trained on OpenResearcher and evaluated on BrowseComp-Plus with a 32K
+context limit, for CLM and the summary harness, each trained with and
+without the efficiency (FLOPs) reward. Switch to “Accuracy vs. compute”
+to see where each run moves; up and to the left is better.</p>
+</div>
+<p>Adding the efficiency reward further reduces inference cost without a
+clear loss in accuracy, for both CLM and the summary harness.</p>
+<h2 id="serving-clms-with-suffix-cache-reuse">7. Serving CLMs with
+Suffix Cache Reuse</h2>
+<p>Prefix-reuse FLOPs charge CLMs for every token they force the server
+to process again. Can we make that cheaper?</p>
+<figure>
+<img src="/draft/assets/img/clm/suffix-cache-reuse.png"
+alt="Standard serving versus Suffix Cache Reuse after an edit replaces B with B’. Standard serving reuses the cache for A but must process B’ and all of C again. Suffix Cache Reuse also reuses the cached states of C." />
+<figcaption aria-hidden="true">Standard serving versus Suffix Cache
+Reuse after an edit replaces B with B’. Standard serving reuses the
+cache for A but must process B’ and all of C again. Suffix Cache Reuse
+also reuses the cached states of C.</figcaption>
+</figure>
+<p>Say the context is A B C, and an edit replaces B with B’. Standard
+serving reuses the cache for A but processes B’ and then C again,
+because C now sits after different text at different positions.
+<strong>Suffix Cache Reuse (SCR)</strong> keeps the cached states for C,
+shifts their position encodings to the new positions, and splices them
+in after B’. Only B’ and any new tokens get processed. This is an
+approximation: C’s cached states still encode the old prefix, which can
+even help in some cases, since they retain richer information from the
+past. To limit how much approximation a single edit can introduce, we
+relocate at most six surviving spans per edit.<span
+class="sidenote-wrapper"><label for="sn-9" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-9" class="margin-toggle"/><span
+class="sidenote">SCR is implemented as a patch to SGLang. Qwen3.6-27B is
+a hybrid model: 48 of its 64 layers use linear attention, which keeps a
+fixed-size recurrent state instead of a per-token cache. For those
+layers, we continue from a snapshot of the state taken before the edit,
+and the edit is reflected through the 16 full-attention layers.<br />
+<br />
+</span></span></p>
+<div class="clm-chart" data-chart="scr">
+<p><strong>Suffix Cache Reuse on BrowseComp-Plus with a Qwen3.6-27B
+CLM.</strong> All 830 questions were served both ways. Left: compute per
+question, split into prefill and decode, with accuracy under each bar.
+Right: where the prompt tokens came from, over all turns or only the
+turns right after a context edit.</p>
+</div>
+<p>Accuracy is identical, 60.2% both ways, while compute drops from
+10.98 to 7.14 PFLOPs per question, a 35% saving. On the turns right
+after an edit, SCR serves 28% of the prompt from relocated cache that
+standard serving would have recomputed.</p>
+<p>SCR is not limited to CLMs. The chat templates of many reasoning
+models drop the reasoning blocks of earlier assistant turns once the
+next user message arrives. To the server, that’s an edit: everything
+after the first dropped block gets recomputed, even though the agent
+never touched its context. SCR treats this like any other edit. On
+BrowseComp-Plus, SCR serves 7.8% of all prompt tokens from relocated
+cache, and 5.3 points of that come from dropped reasoning, against 2.5
+from other context edits.</p>
+<h2 id="limitations-and-open-questions">8. Limitations and open
+questions</h2>
+<ul>
+<li><strong>It depends on the model.</strong> CLM leaves the decision of
+when and how to edit the context to the model, so its gains grow with
+the model’s ability to make that decision. Qwen3.5-9B, for example,
+edits its context less often than Qwen3.6-27B.</li>
+<li><strong>Models can’t count their own tokens.</strong> When we asked
+models to estimate how many tokens were in their context, they tended to
+answer with a few recurring values (like 6.2K, 9.8K, or 10.4K), and
+Claude 4.6 Sonnet tended to underestimate; GPT-5.4 was the best
+calibrated of the three models we tried. A token-count hint helps, and
+helps more the closer it is to the question. Today, CLM gets an editing
+reminder shortly before it reaches its budget; better built-in awareness
+would make that less necessary.</li>
+<li><strong>An editable context is a new attack surface.</strong> A
+prompt injection could try to get the model to gradually rewrite its own
+working memory, drop important constraints, or plant false history in a
+summary. Such attacks are a practical concern: OpenAI has reported that
+<a
+href="https://alignment.openai.com/misalignment-reports/self-replicating-prompt-injections-exist/">self-replicating
+prompt injections exist</a>. Characterizing these attacks and defending
+against them without giving up flexibility is important future
+work.</li>
+</ul>
+<h2 id="conclusion">9. Conclusion</h2>
+<p>Context Language Models turn context management from a rule written
+into the harness into something the model does itself. The
+implementation is simple, a context file the model can edit, yet it
+outperforms hand-designed strategies on tasks from synthetic diagnostics
+to 24-hour agent swarms. Because the behavior lives in the model, it can
+be steered with a sentence, improved by evolving a skill document, and
+trained with RL, and Suffix Cache Reuse keeps it cheap to serve.</p>
+<p><strong>Where we’d go next.</strong> The obvious direction is scaling
+RL so that CLMs can explore and learn context-management strategies well
+beyond what we tried here. A second is distilling existing harnesses
+into CLMs. A standard language model maps input tokens to next-token
+probabilities, and the harness decides how the context is built and
+updated. Most harness operations are context transformations, so they
+can be written as CLM actions and eventually learned in the weights.
+Seen this way, a harness is a form of procedural memory: a skill
+developed outside the model that a CLM can absorb and use more
+generally.</p>
+<h2 id="acknowledgements">Acknowledgements</h2>
+<p>We thank Sewon Min and Steven Zijian Chen for helpful discussions,
+and Ilia Kulikov and Mickel Liu for their help with infrastructure
+questions. This work was supported by the Singapore National Research
+Foundation and the National AI Group in the Singapore Ministry of
+Digital Development and Information under the AI Visiting Professorship
+Programme (award number AIVP-2024-001), and by the AI2050 program at
+Schmidt Sciences.</p>
+<h2 id="citation">Citation</h2>
+<div class="citation">
+<p>Please cite this work as:</p>
+<pre><code>Shao, Rulin and Shen, Shannon Zejiang and Yin, Junjie Oscar and Li, Yuetai and
+Wang, Minheng and Ivison, Hamish and Poovendran, Radha and Lambert, Nathan and
+Xiao, Teng and Lewis, Mike and Yih, Wen-tau and Zettlemoyer, Luke and
+Koh, Pang Wei, &quot;Context Language Models&quot;, 2026.</code></pre>
+<p>Or use the BibTeX citation:</p>
+<pre><code>@misc{shao2026contextlanguagemodels,
+      title={Context Language Models},
+      author={Rulin Shao and Shannon Zejiang Shen and Junjie Oscar Yin and Yuetai Li and Minheng Wang and Hamish Ivison and Radha Poovendran and Nathan Lambert and Teng Xiao and Mike Lewis and Wen-tau Yih and Luke Zettlemoyer and Pang Wei Koh},
+      year={2026},
+}</code></pre>
+</div>
+<div class="draft-note">
+<p>Add the arXiv ID and URL to both citation formats once the paper is
+posted.</p>
+</div>]]></content><author><name>WAI</name></author><summary type="html"><![CDATA[Context Language Models (CLMs) are language models that manage their own context: the context is a file the model can edit. They beat hand-designed context management out of the box, and they can learn better strategies in context and in weights.]]></summary></entry><entry><title type="html">TMax: A Simple Recipe for Terminal Agents</title><link href="https://wai-org.com/draft/blog/tmax/" rel="alternate" type="text/html" title="TMax: A Simple Recipe for Terminal Agents" /><published>2026-06-16T00:00:00-07:00</published><updated>2026-06-16T00:00:00-07:00</updated><id>https://wai-org.com/draft/blog/tmax-a-simple-recipe-for-terminal-agents</id><content type="html" xml:base="https://wai-org.com/draft/blog/tmax/"><![CDATA[<div class="post-hero">
+<h1 class="title">
+<img class="title-logo" src="/assets/img/tmax/logo.png" alt="TMax mascot logo">
+TMax: A Simple Recipe for Terminal Agents
+</h1>
+<div class="byline">
+<p><strong>Hamish Ivison</strong>*, <strong>Junjie Oscar
+Yin</strong>*,<br> Rulin Shao, Teng Xiao, Nathan Lambert, Hannaneh
+Hajishirzi<span
+class="sidenote-wrapper"><label for="sn-0" class="margin-toggle">&#8853;</label><input type="checkbox" id="sn-0" class="margin-toggle"/><span
+class="marginnote">*Co-first authors. Work done while HI and NL were at
+Ai2.<br />
+<br />
+</span></span></p>
+</div>
+<div class="affiliations">
+<p>Allen Institute for AI · University of Washington</p>
+</div>
+<div class="post-date">
+<p>June 16, 2026</p>
+</div>
+</div>
+<figure>
+<img src="/assets/img/tmax/teaser.png"
+alt="Terminal Bench 2.0 vs. model size. TMax dominates the Pareto frontier for models under 32B: TMax-9B is the strongest open model under 10B we compare against, and TMax-27B is competitive with open-weight models an order of magnitude larger." />
+<figcaption aria-hidden="true">Terminal Bench 2.0 vs. model size. TMax
+dominates the Pareto frontier for models under 32B: TMax-9B is the
+strongest open model under 10B we compare against, and TMax-27B is
+competitive with open-weight models an order of magnitude
+larger.</figcaption>
+</figure>
+<div class="tldr">
+<p><span class="tldr-label">TL;DR</span></p>
+<p><strong>TMax</strong> is the strongest open RL recipe for terminal
+agents to date, bringing open data recipes closer to the frontier. We
+release two things. The first is <strong>TMax-15k</strong>, a dataset of
+<strong>14,600 RL environments</strong> built from a compositional
+pipeline with explicit control over difficulty and diversity. It is over
+<strong>2.5× larger</strong> than the next-largest open terminal dataset
+that releases full environment data. The second is a <strong>simple,
+outcome-only RL recipe</strong> (GRPO plus a few stability fixes), which
+we use to train a family of open models from <strong>2B to
+27B</strong>.</p>
+<p><a href="https://huggingface.co/allenai/tmax-9b"
+class="dataset-tag">TMax-9B</a> reaches <strong>27.2%</strong> on <a
+href="https://www.tbench.ai/leaderboard/terminal-bench/2.0">Terminal
+Bench 2.0</a>. Under official Terminal Bench settings this is the
+strongest open-weights model under 10B we are aware of: it beats 32B
+terminal agents from prior work and approaches closed models like Claude
+Haiku 4.5 (29.8%). Scaling the same recipe up, <a
+href="https://huggingface.co/allenai/tmax-27b"
+class="dataset-tag">TMax-27B</a> improves to <strong>42.7%</strong>,
+approaching models 10 to 40× its size like the 1T-parameter Kimi K2.5
+(43.2%).</p>
+<p><strong>Resources:</strong> <a
+href="https://arxiv.org/abs/2606.23321">📄 Paper</a> · <a
+href="https://github.com/hamishivi/tmax">👨‍💻 GitHub</a> · <a
+href="https://huggingface.co/collections/allenai/tmax">🤗 HF Models</a>
+· <a href="https://huggingface.co/collections/allenai/tmax">🤗 HF
+Dataset</a> · <a
+href="https://x.com/waiorg/status/2069205740699725944">🐦 Tweet</a></p>
+</div>
+<h2 id="terminal-agents-and-why-theyre-hard-to-train">1. Terminal
+agents, and why they’re hard to train</h2>
+<p>Terminal-using agents have quickly become the most popular way people
+put language models to work. A <em>terminal agent</em> is a language
+model that interacts with a terminal environment: by issuing commands in
+a shell, calling tools, reading the output, and iterating. It might
+resolve a failing build, profile a slow service, recover a corrupted
+archive, or wire up a multi-service stack. The model plans, runs a
+command, looks at <code>stdout</code>/<code>stderr</code>, and tries
+again. This is now the dominant interface for agentic coding
+products,<span
+class="sidenote-wrapper"><label for="sn-1" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-1" class="margin-toggle"/><span
+class="sidenote">For example, Anthropic’s Claude Code and other
+terminal-native coding products.<br />
+<br />
+</span></span> and the tasks these agents are asked to solve keep
+getting more complex and long-horizon.</p>
+<p>Despite this popularity, there is surprisingly little <em>open</em>
+academic work on training terminal agents with RL. We think this comes
+down to three gaps:</p>
+<ul>
+<li><strong>Hard benchmarks.</strong> Evaluations like <a
+href="https://www.tbench.ai/">Terminal Bench</a><span
+class="sidenote-wrapper"><label for="sn-2" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-2" class="margin-toggle"/><span
+class="sidenote">Merrill et al., “Terminal Bench,” 2026.<br />
+<br />
+</span></span> capture genuinely long-horizon, multi-step terminal work,
+but they are hard, and much prior work sidesteps them in favor of
+simpler bug-fixing or natural-language-to-bash setups.</li>
+<li><strong>A lack of data.</strong> Real-world terminal traces are
+scarce or proprietary, and the synthetic datasets that do exist tend to
+be small, narrow (mostly file manipulation or one dominant domain), or
+never release their actual RL environments.</li>
+<li><strong>A lack of a simple baseline recipe.</strong> Most
+data-generation papers stop at supervised fine-tuning; the ones that try
+RL often report ~1-point gains, leaving little signal for the community
+to build on.</li>
+</ul>
+<p>TMax closes the data and recipe gaps. We provide a large,
+difficulty-controlled dataset of complex terminal tasks and a simple RL
+recipe that produces large, reliable improvements of over <strong>5
+points</strong> on Terminal Bench, with gains that transfer across tasks
+and harnesses. Our contributions are:</p>
+<ol type="1">
+<li><strong>TMax-15k</strong>, a dataset of 14,600 RL environments, over
+2.5× larger than prior open terminal datasets and notably harder.</li>
+<li><strong>Open-weights terminal agents at 2B/4B/9B/27B</strong> scale,
+trained on this data. Our best 9B model reaches 27.2% on Terminal Bench
+2.0, the strongest open model under 10B we are aware of under official
+settings.</li>
+<li><strong>A simple, reproducible RL recipe</strong>, with all
+components released for training the models.</li>
+<li><strong>Evidence that terminal RL generalizes</strong> across
+harnesses and across tasks, suggesting the model learns real new skills
+rather than overfitting a single setup.</li>
+</ol>
+<h2 id="generating-terminal-environments-at-scale">2. Generating
+terminal environments at scale</h2>
+<p>Training a terminal agent with RL needs a lot of executable
+environments: each task has to ship with the files, dependencies, and an
+automated check that verifies whether the agent succeeded. Existing
+pipelines tend to fall short in three ways. They lean on
+<strong>complex, multi-stage generation</strong> that is hard to scale;
+they produce <strong>homogeneous</strong> task suites dominated by one
+or two domains; and they offer <strong>little control over
+difficulty</strong>, yielding tasks that are either trivially solved or
+entirely out of reach.</p>
+<p>We propose a simple terminal environment generation pipeline that is
+scalable, diverse, and difficulty-aware. We use <a
+href="https://deepmind.google/technologies/gemini/">Gemini-3-Pro</a> as
+the generator,<span
+class="sidenote-wrapper"><label for="sn-3" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-3" class="margin-toggle"/><span
+class="sidenote">We chose Gemini-3-Pro for its strong performance on
+Terminal Bench.<br />
+<br />
+</span></span> and the core idea is simple: <strong>compose each task by
+hierarchically sampling from a set of structured axes.</strong></p>
+<figure>
+<img src="/assets/img/tmax/data-pipeline.png"
+alt="The TMax data pipeline. Each task is composed by hierarchically sampling across 9 structured axes, after which the generator instantiates a Dockerfile, a unit-test verifier, source files, and task instructions. A single build step, with no teacher-based validation, keeps generation cheap to scale." />
+<figcaption aria-hidden="true">The TMax data pipeline. Each task is
+composed by hierarchically sampling across 9 structured axes, after
+which the generator instantiates a Dockerfile, a unit-test verifier,
+source files, and task instructions. A single build step, with no
+teacher-based validation, keeps generation cheap to scale.</figcaption>
+</figure>
+<h3 id="generation-pipeline">2.1 Generation pipeline</h3>
+<p>A task is composed by drawing one value from each of <strong>nine
+structured axes</strong>. We follow <a
+href="https://huggingface.co/nvidia">Nemotron-Terminal</a> to seed the
+first two axes<span
+class="sidenote-wrapper"><label for="sn-4" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-4" class="margin-toggle"/><span
+class="sidenote">Pi et al., “Nemotron-Terminal,” 2026. We seed our
+domain and skill axes from their taxonomy.<br />
+<br />
+</span></span> (domain and skills), and introduce six orthogonal axes
+targeting diversity and difficulty as shown in the figure above.</p>
+<p>Because each task is sampled across these axes, the sampler yields
+combinatorially many distinct task signatures, while still letting us
+calibrate each axis on its own. The sampling is hierarchical because a
+few axes, such as personas and skills, are conditioned on the sampled
+domain to keep combination compatible. We <em>intentionally make three
+design choices</em> for the synthetic terminal data generation.</p>
+<p><strong>Scalability via soft filtering.</strong> Prior pipelines
+validate every task by having a strong model attempt it for multiple
+rollouts, which is expensive. We skip that step entirely. Our RL
+training already does <em>soft</em> filtering for free: it drops any
+task where all rollouts get the same reward, since those contribute no
+gradient. In practice the all-zero rate on our data is low (fewer than 8
+samples filtered per batch). All we need to guarantee at inference time
+is that the environment successfully <em>builds</em>, which we do with
+one Docker image per task (sharing a pre-built base image per domain).
+Turning two build steps into one allows synthetic environments to scale
+cheaply.</p>
+<p><strong>Diversity via hierarchical sampling.</strong> The
+hierarchical sampler is itself the main diversity mechanism, and we add
+two more. First, we condition generation on domain-specific
+<strong>personas</strong><span
+class="sidenote-wrapper"><label for="sn-5" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-5" class="margin-toggle"/><span
+class="sidenote">Persona-conditioned synthesis follows a line of prior
+data work, e.g. Ge et al., “Scaling Synthetic Data Creation with
+Personas,” 2025.<br />
+<br />
+</span></span> (6–18 per domain), so that a “red-team operator crafting
+an evasion payload” naturally shapes a plausible security task. Second,
+we incorporate <strong>multi-modal fixtures</strong> as part of task
+files: PNG, audio file, video, stripped binary, vendored package, etc.
+The policy itself stays a text-only model. It inspects and interacts
+these artifacts through ordinary terminal tooling (OCR, audio
+transcription, <code>ffmpeg</code>).</p>
+<p><strong>Difficulty via explicit calibration.</strong> To avoid the
+usual bimodal “trivial or impossible” task split, we calibrate
+difficulty along two new complexity axes (<em>task complexity</em>, from
+a handful of commands to intricate 30–60-command workflows, and
+<em>command complexity</em>, from bash-only to bash + code + system
+services) and sample uniformly across buckets. We also go beyond exact
+string-equality checks with <strong>graded verifiers</strong>: metric
+thresholds (e.g. accuracy ≥ 0.95), adversarial corpora (accept clean,
+reject malicious), fuzz equivalence against an oracle, or multi-protocol
+service checks. Thresholds give a continuous signal for terminal agents
+to hillclimb, while also increasing turn length.</p>
+<p>We release the full set of RL environments as <a
+href="https://huggingface.co/datasets/allenai/tmax-15k"
+class="dataset-tag">TMax-15K</a>.</p>
+<h3 id="comparing-terminal-datasets">2.2 Comparing terminal
+datasets</h3>
+<p>We annotated our data and six prior datasets with <a
+href="https://deepmind.google/technologies/gemini/">Gemini-3-Pro</a> and
+measured difficulty with <a
+href="https://deepmind.google/technologies/gemini/">Gemini-3-Flash</a>
+(250-task subsample per dataset, 8 rollouts each).</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Dataset</th>
+<th>Size</th>
+<th>Pass@1</th>
+<th>Pass@8</th>
+<th>Domain balance</th>
+<th>Skill balance</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>TMax-15k (ours)</strong></td>
+<td><strong>15k</strong></td>
+<td><strong>42%</strong></td>
+<td><strong>53%</strong></td>
+<td><strong>0.998</strong></td>
+<td><strong>0.732</strong></td>
+</tr>
+<tr class="even">
+<td>Endless Terminals</td>
+<td>2.4k</td>
+<td>92%</td>
+<td>95%</td>
+<td>0.481</td>
+<td>0.284</td>
+</tr>
+<tr class="odd">
+<td>Open Thoughts Agents</td>
+<td>0.7k</td>
+<td>51%</td>
+<td>60%</td>
+<td>0.292</td>
+<td>0.153</td>
+</tr>
+<tr class="even">
+<td>TermiGen</td>
+<td>3k</td>
+<td>57%</td>
+<td>66%</td>
+<td>0.646</td>
+<td>0.477</td>
+</tr>
+<tr class="odd">
+<td>TerminalTraj</td>
+<td>5.5k</td>
+<td>54%</td>
+<td>65%</td>
+<td>0.363</td>
+<td>0.374</td>
+</tr>
+<tr class="even">
+<td>CLI-Gym</td>
+<td>1.5k</td>
+<td>41%</td>
+<td>55%</td>
+<td>0.283</td>
+<td>0.061</td>
+</tr>
+<tr class="odd">
+<td>SWE-smith</td>
+<td>59k</td>
+<td>54%</td>
+<td>72%</td>
+<td>0.146</td>
+<td>0.042</td>
+</tr>
+</tbody>
+</table>
+<p><em>Difficulty and balance statistics (Gemini-3-Flash, pass@k as mean
+over tasks). Balance is a “fraction-of-uniform” diversity score in [0,
+1].</em></p>
+<p>Two things worth to note. First, <strong>balance</strong>. Prior
+datasets pile 34–95% of their mass onto a single domain (software
+engineering alone is 95% of SWE-smith), while ours spreads roughly
+uniformly across all nine. That gives us the highest domain balance
+(0.998) and skill-type balance (0.732) of any dataset.</p>
+<figure>
+<img src="/assets/img/tmax/data-composition.png"
+alt="Domain distribution across datasets. Prior datasets skew heavily toward one or two domains; our compositional sampler yields balanced coverage across all nine." />
+<figcaption aria-hidden="true">Domain distribution across datasets.
+Prior datasets skew heavily toward one or two domains; our compositional
+sampler yields balanced coverage across all nine.</figcaption>
+</figure>
+<p>Second, <strong>difficulty</strong>. Our data is among the hardest of
+the bunch. Pass@1 is 42% (vs. 41–92% for prior datasets), and it has the
+<strong>lowest pass@8</strong> (53%). The difficulty gap persists even
+as we draw more rollouts, so the tasks are genuinely hard rather than
+just high-variance. We also checked for contamination with a 13-gram
+sliding window against the Terminal Bench tasks and found <strong>0%
+overlap</strong>.</p>
+<h3 id="sft-data-and-a-simple-harness">2.3 SFT data and a simple
+harness</h3>
+<p>A light SFT warm-up can help stability and performance before
+RL,<span
+class="sidenote-wrapper"><label for="sn-6" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-6" class="margin-toggle"/><span
+class="sidenote">Shown e.g. in DeepSeek-R1 and Olmo 3.<br />
+<br />
+</span></span> so for our weaker-model experiments on the older <a
+href="https://huggingface.co/Qwen">Qwen3-8B</a>, we also generate a
+small SFT dataset. Reusing the same pipeline, we make 2.2k more
+environments and sample 8 trajectories each from <a
+href="https://huggingface.co/Qwen">Qwen3.6-27B</a>, for 16.5K
+trajectories (8K of them successful). We use this SFT data only for the
+Qwen3-8B runs, and release it as <a
+href="https://huggingface.co/datasets/allenai/tmax-sft-16.5k"
+class="dataset-tag">TMax-SFT-16.5K</a>.</p>
+<p>Both data generation and RL rollouts run through a simple harness
+based on <a
+href="https://github.com/SWE-agent/mini-swe-agent">mini-swe-agent</a>
+with a persistent shell. We found the default Terminus-2 harness more
+brittle with small models, since it expects the agent to send raw
+keystrokes.</p>
+<h2 id="training-tmax-with-rl">3. Training TMax with RL</h2>
+<p>With the data in hand, the question is whether a <em>simple</em>
+recipe can turn it into a strong agent. We deliberately keep the
+algorithm plain. The goal is a clean, reproducible testbed with obvious
+room for future algorithmic improvement.</p>
+<h3 id="training-recipe">3.1 Training recipe</h3>
+<p>We train with a variant of <strong>GRPO</strong><span
+class="sidenote-wrapper"><label for="sn-7" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-7" class="margin-toggle"/><span
+class="sidenote">Shao et al., “DeepSeekMath,” 2024.<br />
+<br />
+</span></span>, outcome-only with no learned reward model, plus a
+handful of changes for stability in the long-horizon agentic
+setting:</p>
+<ul>
+<li><strong>DPPO</strong> instead of vanilla GRPO.<span
+class="sidenote-wrapper"><label for="sn-8" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-8" class="margin-toggle"/><span
+class="sidenote">Qi et al., “Rethinking the Trust Region for LLM RL”
+(DPPO), 2026.<br />
+<br />
+</span></span> DPPO masks tokens where the inference (vLLM) and training
+logprobs disagree, using a binary approximation of the total-variation
+divergence. This small change meaningfully tames training collapse.</li>
+<li>A <strong>token-level loss</strong>,<span
+class="sidenote-wrapper"><label for="sn-9" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-9" class="margin-toggle"/><span
+class="sidenote">Token-level loss as in Yu et al., “DAPO,” 2025.<br />
+<br />
+</span></span> fully <strong>asynchronous</strong> training, filtering
+of zero-standard-deviation groups, and active sampling to keep batches
+full.<span
+class="sidenote-wrapper"><label for="sn-10" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-10" class="margin-toggle"/><span
+class="sidenote">Following Olmo 3.<br />
+<br />
+</span></span></li>
+<li>An <strong>FP32 LM head</strong>, keeping the language-model head in
+full precision to minimize the train/inference mismatch. This mattered
+most for the hybrid Qwen3.5 models.</li>
+</ul>
+<p>Infrastructure-wise, we extend <a
+href="https://github.com/allenai/open-instruct">open-instruct</a>, use
+<a href="https://github.com/vllm-project/vllm">vLLM</a> for rollouts,
+and run sandboxes via <a href="https://podman.io/">Podman</a> or
+Apptainer. A typical run uses 2 nodes for training and 6 for inference
+on H100s, and takes 2–3 days. The key hyperparameters are:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Hyperparameter</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Training steps</td>
+<td>500</td>
+</tr>
+<tr class="even">
+<td>Group size</td>
+<td>32</td>
+</tr>
+<tr class="odd">
+<td>Prompts per batch</td>
+<td>8</td>
+</tr>
+<tr class="even">
+<td>Max context length</td>
+<td>65,536 tokens</td>
+</tr>
+<tr class="odd">
+<td>Max tool calls per episode</td>
+<td>64</td>
+</tr>
+</tbody>
+</table>
+<p>We keep thinking on intermediate turns (“interleaved thinking”), and
+evaluate on Terminal Bench 2.1 and <a
+href="https://www.tbench.ai/">Terminal Bench Lite</a>, averaging over 3
+runs.</p>
+<h3 id="tmax-15k-outperforms-other-terminal-data">3.2 TMax-15K
+outperforms other terminal data</h3>
+<p>We first hold the model fixed (<a
+href="https://huggingface.co/Qwen">Qwen3.5-9B</a>) and vary only the RL
+dataset. Training on <strong>TMax-15k gives the strongest Terminal Bench
+performance of any dataset we tried</strong>. We release the resulting
+model as <a href="https://huggingface.co/allenai/tmax-9b"
+class="dataset-tag">TMax-9B</a>.</p>
+<table>
+<thead>
+<tr class="header">
+<th>RL dataset</th>
+<th>TB Lite</th>
+<th>TB 2.1</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>None (Qwen3.5-9B)</td>
+<td>41.9</td>
+<td>16.1</td>
+</tr>
+<tr class="even">
+<td>TermiGen</td>
+<td>49.4</td>
+<td>25.1</td>
+</tr>
+<tr class="odd">
+<td>Endless Terminals</td>
+<td>52.6</td>
+<td>25.5</td>
+</tr>
+<tr class="even">
+<td>OpenThinker-Agent</td>
+<td>53.0</td>
+<td>25.1</td>
+</tr>
+<tr class="odd">
+<td>TerminalTraj</td>
+<td>45.8</td>
+<td>18.0</td>
+</tr>
+<tr class="even">
+<td>CLI-Gym</td>
+<td>50.7</td>
+<td>25.1</td>
+</tr>
+<tr class="odd">
+<td>SWE-Smith</td>
+<td>47.2</td>
+<td>21.0</td>
+</tr>
+<tr class="even">
+<td><strong>TMax-15k (ours)</strong></td>
+<td><strong>57.2</strong></td>
+<td><strong>28.8</strong></td>
+</tr>
+</tbody>
+</table>
+<p><em>RL on Qwen3.5-9B across datasets; mean over 3 runs. Our data
+improve Terminal Bench 2.1 by nearly 13 points over the base
+model.</em></p>
+<p>We find that TMax-15K stays difficult throughout training. If we plot
+the average number of steps the model takes during training,
+<strong>TMax-15k consistently drives more steps per episode</strong>
+than other datasets. The tasks keep demanding real, multi-step work
+rather than being solved in a couple of commands.</p>
+<figure>
+<img src="/assets/img/tmax/step-count.png"
+alt="Average steps per episode over training (15-step smoothing). Training on TMax-15k sustains higher step counts than other datasets, indicating the tasks stay difficult throughout." />
+<figcaption aria-hidden="true">Average steps per episode over training
+(15-step smoothing). Training on TMax-15k sustains higher step counts
+than other datasets, indicating the tasks stay difficult
+throughout.</figcaption>
+</figure>
+<p>We also see the model <em>learn to think more</em> over the course of
+training: the number of tokens it spends per assistant turn, for both
+reasoning and tool-calling, climbs steadily. This is the agentic
+analogue of inference-time reasoning scaling, and it tracks the model’s
+improving performance.</p>
+<figure>
+<img src="/assets/img/tmax/turn-tokens.png" class="fig-small"
+alt="Average assistant-turn and tool-call length (tokens) over training. Per-turn output grows, suggesting the model learns to make better use of inference-time compute." />
+<figcaption aria-hidden="true">Average assistant-turn and tool-call
+length (tokens) over training. Per-turn output grows, suggesting the
+model learns to make better use of inference-time compute.</figcaption>
+</figure>
+<h3 id="tmax-9b-outperforms-prior-small-terminal-agents">3.3 TMax-9B
+outperforms prior small terminal agents</h3>
+<p>At <strong>27.2%</strong> on Terminal Bench 2.0, TMax-9B is the best
+open-weights model under 10B we compare against under official Terminal
+Bench settings,<span
+class="sidenote-wrapper"><label for="sn-11" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-11" class="margin-toggle"/><span
+class="sidenote">Terminal Bench scores can be sensitive to harness and
+timeout settings. With non-standard settings (for example, overriding
+the default timeouts) the base Qwen3.5-9B can score noticeably higher,
+so we report all numbers under official Terminal Bench settings for a
+fair comparison.<br />
+<br />
+</span></span> beating 32B terminal agents from several prior works and
+approaching closed offerings like Claude Haiku 4.5 (29.8%).</p>
+<p>The same recipe scales across the whole Qwen3.5 family. TMax-2B and
+TMax-4B reach 2.9% and 18.9% (from 2.3% and 16.6%), and <a
+href="https://huggingface.co/allenai/tmax-27b"
+class="dataset-tag">TMax-27B</a> (built on Qwen3.6-27B) reaches
+<strong>42.7%</strong> (from 39.6%). At that size, TMax-27B approaches
+models that are a few order of magnitude larger, like the 1T-parameter
+Kimi K2.5 (43.2%) and the 230B MiniMax M2.7 (45.1%).</p>
+<h3 id="generalization-across-tasks-harnesses-and-models">3.4
+Generalization across tasks, harnesses, and models</h3>
+<p>Finally, we show our training and data recipe generalizes well across
+three important axes: tasks (i.e., what it is asked to do), harnesses
+(i.e., what tools and prompts it is provided when performing tasks), and
+model families (i.e., the starting point model).</p>
+<p><strong>Across tasks.</strong> Evaluating TMax-9B beyond Terminal
+Bench, performance improves across the board, including on a non-agentic
+math benchmark:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Benchmark</th>
+<th>Qwen3.5-9B</th>
+<th>TMax-9B</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>SWE-Bench Verified</td>
+<td>44.0</td>
+<td><strong>53.5</strong></td>
+</tr>
+<tr class="even">
+<td>AIME’24/25 (terminal-agent)</td>
+<td>73.3</td>
+<td><strong>91.1</strong></td>
+</tr>
+</tbody>
+</table>
+<p><em>Generalization to other tasks; mean over 3 runs. RL on terminal
+data improves an agentic SWE benchmark by ~9 points and math by
+~18.</em></p>
+<p><strong>Across harnesses.</strong> When we swap out the harness for
+different prompts and tools than the one used during RL, TMax-9B
+improves by <strong>roughly 9 to 15 points in every harness we
+tried</strong>, even ones it never saw in training.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Harness</th>
+<th>Qwen3.5-9B</th>
+<th>TMax-9B</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Ours (mini-swe-agent + persistent shell)</td>
+<td>41.9</td>
+<td><strong>57.2</strong></td>
+</tr>
+<tr class="even">
+<td>OpenHands</td>
+<td>36.0</td>
+<td><strong>46.9</strong></td>
+</tr>
+<tr class="odd">
+<td>mini-swe-agent</td>
+<td>44.1</td>
+<td><strong>55.3</strong></td>
+</tr>
+<tr class="even">
+<td>Terminus-2</td>
+<td>36.4</td>
+<td><strong>45.3</strong></td>
+</tr>
+</tbody>
+</table>
+<p><em>Terminal Bench Lite across evaluation harnesses; mean over 3
+runs.</em></p>
+<p><strong>Across models.</strong> We also apply it to the older <a
+href="https://huggingface.co/Qwen/Qwen3-8B">Qwen3-8B</a>, with a short
+SFT warm-start and shorter context. It improves substantially on
+Terminal Bench Lite (7.3 → 17.7), though gains on the harder Terminal
+Bench 2.1 are smaller, since at this scale the benchmark’s difficulty
+makes improvements hard to see.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Model</th>
+<th>TB Lite</th>
+<th>TB 2.1</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Qwen3-8B</td>
+<td>7.3</td>
+<td>1.1</td>
+</tr>
+<tr class="even">
+<td>  + SFT</td>
+<td>11.5</td>
+<td><strong>6.0</strong></td>
+</tr>
+<tr class="odd">
+<td>  + RL</td>
+<td><strong>17.7</strong></td>
+<td>5.2</td>
+</tr>
+</tbody>
+</table>
+<p><em>Qwen3-8B on Terminal Bench Lite and 2.1 after SFT and then RL;
+mean over 3 runs.</em></p>
+<p>Taken together, these results strongly suggest that TMax RL training
+teaches the model <strong>new, transferable terminal skills</strong>,
+not mere harness-fitting or overfitting to Terminal Bench-style
+tasks.</p>
+<h2 id="analysis-discussion">4. Analysis &amp; discussion</h2>
+<p>Two findings shaped the TMax recipe, and we think both are useful for
+the community training terminal agent in this setting.</p>
+<h3 id="strong-models-dont-always-want-your-sft-data">4.1 Strong models
+don’t always want your SFT data</h3>
+<p>Common post-training pipelines advise warm-start RL with SFT for
+training stability. However, we find that existing datasets degrades
+Qwen 3.5’s performance, likedy due to the model undergoing heavy
+post-training already. This holds even for our own mixture, which we
+generated from a strong Qwen3.6-27B teacher. The older Qwen3-8B, by
+contrast, clearly <em>benefits</em> from the same SFT.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Model</th>
+<th>TB Lite</th>
+<th>TB 2.1</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Qwen3.5-9B</td>
+<td><strong>41.9</strong></td>
+<td>16.1</td>
+</tr>
+<tr class="even">
+<td>  + TMax SFT</td>
+<td>35.5</td>
+<td>15.0</td>
+</tr>
+<tr class="odd">
+<td>  + large SFT</td>
+<td>31.3</td>
+<td>16.9</td>
+</tr>
+<tr class="even">
+<td>Qwen3-8B</td>
+<td>7.3</td>
+<td>1.1</td>
+</tr>
+<tr class="odd">
+<td>  + TMax SFT</td>
+<td>11.5</td>
+<td>6.0</td>
+</tr>
+<tr class="even">
+<td>  + large SFT</td>
+<td><strong>16.4</strong></td>
+<td><strong>7.9</strong></td>
+</tr>
+</tbody>
+</table>
+<p><em>SFT before RL helps the older model but hurts the stronger
+one.</em></p>
+<p>We suspect the larger mixtures lean on relatively weak teacher models
+from prior work, and that a heavily post-trained model has less to gain
+and more to lose from imitation. We leave further exploration of good
+SFT mixtures for Qwen 3.5 as future work.</p>
+<h3 id="terminal-agent-rl-is-hard-to-stabilize">4.2 Terminal-agent RL is
+hard to stabilize</h3>
+<p>We found training was frequently unstable and often collapsed past
+200–300 steps. The main culprit is numeric mismatch between training and
+inference, which the hybrid Qwen3.5 architecture makes worse. Keeping
+the LM head in FP32 removes the worst logprob spikes (below), and moving
+from GRPO to DPPO, together with a larger group size, further limits
+collapse. Long horizons (often 20+ steps) and infrastructure load from
+running many sandboxes make things harder still. We give the full
+analysis, including the GRPO-vs-DPPO and group-size comparisons, in the
+paper.</p>
+<figure>
+<img src="/assets/img/tmax/fp32-lm-head.png" class="fig-small"
+alt="Maximum inference-vs-trainer logprob difference over the first 100 steps for Qwen3.5-9B. The FP32 LM head removes the large spikes (Qwen3-8B does not show them even without it)." />
+<figcaption aria-hidden="true">Maximum inference-vs-trainer logprob
+difference over the first 100 steps for Qwen3.5-9B. The FP32 LM head
+removes the large spikes (Qwen3-8B does not show them even without
+it).</figcaption>
+</figure>
+<p>We saw the same instabilities on Qwen3-8B, so this is not a quirk of
+one model family. We believe more stable, longer training would yield
+substantially better models.</p>
+<h2 id="conclusion">5. Conclusion</h2>
+<p>TMax is a simple recipe for training strong terminal agents at small
+scale. Its two pieces are <strong>TMax-15k</strong>, a difficulty- and
+diversity-controlled dataset of 14,600 RL environments, and a plain DPPO
+training recipe. Together they are enough to train
+<strong>TMax-9B</strong> and <strong>TMax-27B</strong>, which is among
+the strongest open-weights models under 10B and 30B at the time of
+writing, respectively. The gains transfer to SWE-Bench, to AIME, and
+across harnesses, which is evidence that the model has genuinely
+improved at using a terminal rather than memorizing one setup. We
+release the data, models, and code as a starting point for others.</p>
+<p><strong>Where we’d go next.</strong> Follow from our results, three
+directions naturally falls out. Better training stability, more complex
+harnesses, and more complex data.</p>
+<p>We hope TMax serves as a strong baseline and a useful testbed for the
+community to improve the stability, performance, and efficiency of
+terminal agents.</p>
+<h2 id="acknowledgements">Acknowledgements</h2>
+<p>TMax is a collaboration between the University of Washington and the
+Allen Institute for AI (Ai2). We thank members of UW NLP and the Open
+Ecosystem team at Ai2 for feedback and discussion throughout this
+project, Michael Noukhovitch for useful discussions on RL stability, and
+the Ai2 Beaker team for help with infrastructure.</p>
+<h2 id="citation">Citation</h2>
+<div class="citation">
+<p>Please cite this work as:</p>
+<pre><code>Ivison, Hamish and Yin, Junjie Oscar and Shao, Rulin and Xiao, Teng and
+Lambert, Nathan and Hajishirzi, Hannaneh, &quot;Tmax: A simple recipe for terminal
+agents&quot;, arXiv preprint arXiv:2606.23321, 2026.</code></pre>
+<p>Or use the BibTeX citation:</p>
+<pre><code>@misc{ivison2026tmaxsimplerecipeterminal,
+      title={Tmax: A simple recipe for terminal agents},
+      author={Hamish Ivison and Junjie Oscar Yin and Rulin Shao and Teng Xiao and Nathan Lambert and Hannaneh Hajishirzi},
+      year={2026},
+      eprint={2606.23321},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2606.23321},
+}</code></pre>
+</div>]]></content><author><name>WAI</name></author><summary type="html"><![CDATA[TMax is the strongest open RL recipe for terminal agents to date, bringing open data recipes closer to the frontier: a 14,600-environment dataset and a simple outcome-only RL recipe, with open models from 2B to 27B.]]></summary></entry></feed>

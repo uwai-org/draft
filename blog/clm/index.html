@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Suffix Cache Reuse Explained &middot; WAI</title>
+  <meta name="description" content="Context Language Models edit their own context, which breaks prefix caching after every edit. Suffix Cache Reuse reuses the cache of the text that survives an edit, cutting serving compute by 35% at the same accuracy.">
+  <meta name="robots" content="noindex, nofollow">
+  <link rel="stylesheet" href="/draft/assets/css/theme.css?v=1790897685">
+  <link rel="stylesheet" href="/draft/assets/css/site.css?v=1790897685"><link type="application/atom+xml" rel="alternate" href="https://wai-org.com/draft/feed.xml" title="WAI" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" crossorigin="anonymous">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js" crossorigin="anonymous"></script>
+  <script>
+    // pandoc --katex emits <span class="math inline|display">raw LaTeX</span>
+    // (no delimiters), so render each .math span directly. The deferred KaTeX
+    // script runs before DOMContentLoaded, so katex is available here.
+    document.addEventListener("DOMContentLoaded", function () {
+      if (!window.katex) return;
+      document.querySelectorAll(".math").forEach(function (el) {
+        try {
+          katex.render(el.textContent, el, {
+            displayMode: el.classList.contains("display"),
+            throwOnError: false
+          });
+        } catch (e) { /* leave raw on error */ }
+      });
+    });
+  </script>
+  <script defer src="https://cdn.plot.ly/plotly-basic-2.35.2.min.js" charset="utf-8"></script>
+  <script defer src="/draft/assets/js/clm-charts.js?v=1790897685"></script>
+  <script defer src="/draft/assets/js/flops-sim.js?v=1790897685"></script>
+  <script defer src="/draft/assets/js/scr-teaser.js?v=1790897685"></script>
+  <style>.draft-note { display: none; }</style>
+</head>
+<body><nav class="site-nav">
+  <div class="site-nav__inner">
+    <a class="site-nav__brand" href="/draft/">WAI</a>
+    <div class="site-nav__links">
+      <a href="/draft/blog/">Blog</a>
+      <a href="/draft/about/">About</a>
+    </div>
+  </div>
+</nav>
+
+  
+
+<nav id="TOC" role="doc-toc">
+  <label for="toc-toggle" class="margin-toggle">Contents</label>
+  <input type="checkbox" id="toc-toggle" class="margin-toggle">
+</nav>
+
+<main>
+  <div class="post-hero">
+<h1 class="title">
+Suffix Cache Reuse Explained
+</h1>
+<div class="post-subtitle">
+<p>Deep Dive in Efficient Serving for <span class="clm-blue">Context
+Language Models</span></p>
+</div>
+<div class="byline">
+<p>Rulin Shao &amp; Oscar Yin in collaboration with others in CLM
+team</p>
+</div>
+<div class="post-date">
+<p>September 28, 2026</p>
+</div>
+</div>
+<div class="scr-tagline">
+<p>“How to stop KV cache from crying<br />
+when they’re no longer in an append-only relationship with the
+context” 😉</p>
+</div>
+<div class="scr-teaser">
+<p><strong>Suffix Cache Reuse.</strong> After an edit replaces
+<em>B</em> with a shorter <em>B′</em>, only <em>B′</em> is prefilled.
+The cache of <em>A</em> is reused as a prefix, and the cache of the
+unchanged <em>C</em> moves to its new positions.</p>
+</div>
+<div class="draft-note">
+<p>Before publishing: confirm author formatting (the TMax post bolds
+co-first authors; the paper marks none), the publication date, and the
+missing links in the resources line (arXiv, tweet). Draft notes like
+this one only show up in local builds; production builds hide them.</p>
+</div>
+<p><strong>Resources:</strong> <a
+href="https://arxiv.org/abs/2609.37725">📄 Paper</a> · <a
+href="https://github.com/facebookresearch/context-language-models">👨‍💻
+GitHub</a> · <a href="#">🐦 Tweet</a></p>
+<p>We recently introduced Context Language Models (CLMs),<span
+class="sidenote-wrapper"><label for="sn-0" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-0" class="margin-toggle"/><span
+class="sidenote">Rulin Shao, Shannon Zejiang Shen, Junjie Oscar Yin,
+Yuetai Li, Minheng Wang, Hamish Ivison, Radha Poovendran, Nathan
+Lambert, Teng Xiao, Mike Lewis, Wen-tau Yih, Luke Zettlemoyer, and Pang
+Wei Koh. “<a href="https://arxiv.org/abs/2609.37725">Context Language
+Models</a>.” arXiv preprint arXiv:2609.37725, 2026.<br />
+<br />
+</span></span><span class="marginnote"><img
+src="/draft/assets/img/clm/clm-paper-cover.jpg" class="clm-cover"
+alt="The Context Language Models paper at a glance" /></span> which
+treat context as a file and can perform arbitrary manipulations on it.
+We showed that CLMs outperform state-of-the-art, human-designed
+context-management harnesses at lower cost. In this blog, we dive deeper
+into the efficiency side of CLMs: what metric do we use to capture the
+realistic serving cost while being cache aware, and how could we further
+improve the cache hit rate by designing serving systems for agents?</p>
+<h2 id="prefix-reuse-flops">Prefix-Reuse FLOPs</h2>
+<p><strong>Background: existing cache reuse often assumes append-only
+context.</strong> Serving engines such as <a
+href="https://arxiv.org/abs/2312.07104">SGLang</a> and <a
+href="https://arxiv.org/abs/2309.06180">vLLM</a> cache KV states, for
+example in a <a href="https://en.wikipedia.org/wiki/Radix_tree">radix
+tree</a>, and reuse the longest matching prefix of a new request. Tokens
+after the first mismatch must be re-prefilled. This works naturally for
+append-only histories, but after an in-the-middle edit, even unchanged
+suffix tokens are recomputed.</p>
+<p>Below is a simplified example: the context <span class="nowrap"><span
+class="ctx-g"><em>A</em></span> <span class="ctx-g"><em>B</em></span>
+<span class="ctx-g"><em>C</em></span></span> is edited into <span
+class="nowrap"><span class="ctx-o"><em>A</em></span> <span
+class="ctx-e"><em>B′</em></span> <span
+class="ctx-e"><em>C</em></span></span>, with the colors matching the
+token strip. The prefix <span class="ctx-o"><em>A</em></span> still
+matches, so its cache is reused; the match breaks at <span
+class="ctx-e"><em>B′</em></span>, so <span
+class="ctx-e"><em>B′</em></span> and the unchanged <span
+class="ctx-e"><em>C</em></span> after it are prefilled together.</p>
+<div class="tok-viz">
+<div class="tok-row" data-label="previous prompt, already in the cache">
+<p><span class="tok-seg prev"><span class="tok">this</span> <span
+class="tok">is</span> <span class="tok">sentence</span> <span
+class="tok">A</span> <span
+class="tok-seg-label"><em>A</em></span></span> <span
+class="tok-seg prev"><span class="tok">this</span> <span
+class="tok">is</span> <span class="tok">sentence</span> <span
+class="tok">B</span> <span
+class="tok-seg-label"><em>B</em></span></span> <span
+class="tok-seg prev"><span class="tok">this</span> <span
+class="tok">is</span> <span class="tok">sentence</span> <span
+class="tok">C</span> <span
+class="tok-seg-label"><em>C</em></span></span></p>
+</div>
+<div class="tok-row" data-label="after rewriting B to B′">
+<p><span class="tok-seg"><span class="tok">this</span> <span
+class="tok">is</span> <span class="tok">sentence</span> <span
+class="tok">A</span> <span class="tok-seg-label"><em>A</em> · hit prefix
+cache</span></span> <span class="tok-seg prefill first-change"><span
+class="tok">compacted</span> <span class="tok">B</span> <span
+class="tok-seg-label"><em>B′</em> · prefilled</span></span> <span
+class="tok-seg prefill"><span class="tok">this</span> <span
+class="tok">is</span> <span class="tok">sentence</span> <span
+class="tok">C</span> <span class="tok-seg-label"><em>C</em> ·
+re-prefilled</span></span></p>
+</div>
+</div>
+<p>When measuring CLM efficiency, we account for <strong>prefix-cache
+reuse</strong>, i.e., which tokens can reuse cached KV states. We
+capture this with a theoretical inference-cost metric we call
+<strong>Prefix-Reuse FLOPs</strong>:</p>
+<p><span class="math display">
+\mathrm{FLOPs}_{\text{Prefix Reuse}}
+= \underbrace{\mathrm{FLOPs}_{\text{prefill}}\big(\text{unmatched
+suffix}\big)}_{\text{from the first prefix mismatch onward}}
++ \underbrace{\mathrm{FLOPs}_{\text{decode}}\big(\text{generated
+tokens}\big)}_{\text{new output tokens}}
+</span></p>
+<p>By default, we use this metric to measure CLM efficiency under
+standard serving. <span class="clm-blue">Thus, when we say CLMs are
+cheaper than the baselines, we’ve accounted for the lower cache hit rate
+caused by context edits.</span><span
+class="sidenote-wrapper"><label for="sn-1" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-1" class="margin-toggle"/><span
+class="sidenote">For example, in these performance-efficiency Pareto
+plots, we used prefix-reuse FLOPs with standard serving. <img
+src="/draft/assets/img/clm/pareto_q36_main.png" class="sn-fig"
+alt="Performance-efficiency Pareto plots from the paper: accuracy against prefix-reuse PFLOPs per question on BrowseComp-Plus, TerminalBench 2.1 and TBLite." /><br />
+<br />
+</span></span> The visualization below shows how an edit affects the
+Prefix-Reuse FLOPs of a single turn.</p>
+<div class="flops-sim" data-mode="standard">
+<p><strong>Prefix Reuse FLOPs of one Qwen3.6-27B turn under standard
+serving.</strong> Move the edit or change its size; the bar splits the
+Prefix Reuse FLOPs of the turn into the prefill of <span
+class="ctx-e"><em>B′</em></span>, the re-prefill of the unchanged <span
+class="ctx-e"><em>C</em></span>, and decoding.</p>
+</div>
+<p>The hit rate does drop with in-the-middle edits and incurs
+re-prefilling of the unchanged C.<span
+class="sidenote-wrapper"><label for="sn-2" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-2" class="margin-toggle"/><span
+class="sidenote">This also happens beyond CLM editing: some chat
+endpoints remove the thinking tokens of earlier turns, so the tokens
+after them are re-prefilled in the next turn.<br />
+<br />
+</span></span> In our experiments with a Qwen3.6-27B CLM on
+BrowseComp-Plus, standard SGLang serves 72.9% of all prompt tokens from
+its prefix cache, but only 24.2% on the turns right after a context
+edit. The rest of an edited turn is prefilled again, including the large
+part of the context that the edit left unchanged.</p>
+<h2 id="suffix-cache-reuse">Suffix Cache Reuse</h2>
+<p>Prefix cache reuse has been the tradition in serving engines because
+context has always been append-only. But we ask: <strong>can we adapt
+serving engines for AI’s convenience</strong>, especially given the
+trend toward recursive self-improvement (RSI)? To that end, we propose a
+simple yet effective method, Suffix Cache Reuse, to make CLM serving
+even more efficient on the system side.</p>
+<div class="tok-viz tok-viz-fig">
+<div class="tok-row" data-label="before the edit">
+<p><span class="tok-seg prev"><span class="tok">this</span> <span
+class="tok">is</span> <span class="tok">sentence</span> <span
+class="tok">A</span> <span
+class="tok-seg-label"><em>A</em></span></span> <span
+class="tok-seg prev"><span class="tok">this</span> <span
+class="tok">is</span> <span class="tok">sentence</span> <span
+class="tok">B</span> <span
+class="tok-seg-label"><em>B</em></span></span> <span
+class="tok-seg prev"><span class="tok">this</span> <span
+class="tok">is</span> <span class="tok">sentence</span> <span
+class="tok">C</span> <span
+class="tok-seg-label"><em>C</em></span></span></p>
+</div>
+<div class="tok-row" data-label="standard serving">
+<p><span class="tok-seg"><span class="tok">this</span> <span
+class="tok">is</span> <span class="tok">sentence</span> <span
+class="tok">A</span> <span class="tok-seg-label"><em>A</em> · hit prefix
+cache</span></span> <span class="tok-seg prefill first-change"><span
+class="tok">compacted</span> <span class="tok">B</span> <span
+class="tok-seg-label"><em>B′</em> · prefilled</span></span> <span
+class="tok-seg prefill"><span class="tok">this</span> <span
+class="tok">is</span> <span class="tok">sentence</span> <span
+class="tok">C</span> <span class="tok-seg-label"><em>C</em> ·
+re-prefilled</span></span></p>
+</div>
+<div class="tok-row" data-label="Suffix Cache Reuse">
+<p><span class="tok-seg"><span class="tok">this</span> <span
+class="tok">is</span> <span class="tok">sentence</span> <span
+class="tok">A</span> <span class="tok-seg-label"><em>A</em> · hit prefix
+cache</span></span> <span class="tok-seg prefill first-change"><span
+class="tok">compacted</span> <span class="tok">B</span> <span
+class="tok-seg-label"><em>B′</em> · prefilled</span></span> <span
+class="tok-seg reused"><span class="tok">this</span> <span
+class="tok">is</span> <span class="tok">sentence</span> <span
+class="tok">C</span> <span class="tok-seg-label"><em>C</em> · suffix
+cache reused</span></span></p>
+</div>
+<div class="tok-caption">
+<p>Standard serving versus Suffix Cache Reuse after an edit replaces B
+with B′. Standard serving hits the prefix cache for A but must prefill
+B′ and re-prefill all of C; Suffix Cache Reuse also reuses the cached
+states of C. The × marks the first prefix-mismatch position.</p>
+</div>
+</div>
+<p>Say the context is <span class="nowrap"><span
+class="ctx-g"><em>A</em></span> <span class="ctx-g"><em>B</em></span>
+<span class="ctx-g"><em>C</em></span></span>, and an edit replaces <span
+class="ctx-g"><em>B</em></span> with <span
+class="ctx-e"><em>B′</em></span>. Standard serving reuses the cache for
+<span class="ctx-o"><em>A</em></span> and then stops, because a prefix
+cache only matches up to the first changed token: <span
+class="ctx-e"><em>B′</em></span> and all of <span
+class="ctx-e"><em>C</em></span> are prefilled again, even though <span
+class="ctx-e"><em>C</em></span> did not change. <strong>Suffix Cache
+Reuse (SCR)</strong> keeps the cached states for <span
+class="ctx-r"><em>C</em></span> instead of throwing them away. When the
+next prompt arrives, SCR compares it with the previous prompt of the
+same session to find the spans that survived the edit, shifts their
+rotary position encodings to their new positions, and splices them in
+after <span class="ctx-e"><em>B′</em></span>. Only <span
+class="ctx-e"><em>B′</em></span> and newly appended tokens are
+prefilled. Below is an interactive visualization of SCR serving compared
+with prefix-reuse-only serving.</p>
+<div class="flops-sim" data-mode="scr">
+<p><strong>Adding Suffix Cache Reuse on top of prefix caching.</strong>
+The same turn as in the first figure; the bars compare prefix caching
+with and without SCR, and the dashed green outline is the re-prefill of
+<span class="ctx-e"><em>C</em></span> that SCR removes. SCR is counted
+with <span class="ctx-e"><em>B′</em></span> prefilled through every
+layer and <span class="ctx-r"><em>C</em></span> relocated as one
+span.</p>
+</div>
+<p><strong>Technical details.</strong> For full-attention layers, SCR
+reuses the cached keys and values of <span
+class="ctx-r"><em>C</em></span> as they are, except for position: after
+the edit, <span class="ctx-r"><em>C</em></span> sits earlier by the
+length difference between <span class="ctx-g"><em>B</em></span> and
+<span class="ctx-e"><em>B′</em></span>, so SCR re-rotates the rotary
+position encodings of its cached keys by that offset. Because rotary
+encodings depend only on position, this rotation is exact and far
+cheaper than recomputing the entries. SCR is an approximation: <span
+class="ctx-r"><em>C</em></span>’s cached states were computed under the
+old context, before the edit. To bound how much approximation one edit
+can introduce, SCR relocates at most six surviving spans per edit, the
+longest first, and re-prefills the rest.<span
+class="sidenote-wrapper"><label for="sn-3" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-3" class="margin-toggle"/><span
+class="sidenote">More details, such as how the cap on relocated spans is
+set and what effect it has, are in Appendix B of the paper; the main
+text uses k = 6.<br />
+<br />
+</span></span></p>
+<p>Qwen3.6-27B is a hybrid model: 48 of its 64 layers use linear
+attention, which keeps a fixed-size recurrent state rather than a
+per-token cache, so there are no per-token entries to move. For those
+layers, SCR continues from a snapshot of the recurrent state taken
+before the edit. The edit itself is seen by the 16 full-attention
+layers, and through their outputs it still reaches the later
+linear-attention layers.</p>
+<figure>
+<img src="/draft/assets/img/clm/full-vs-linear-attention-reuse.png"
+alt="Suffix Cache Reuse for full-attention layers (left) and linear-attention layers (right)." />
+<figcaption aria-hidden="true">Suffix Cache Reuse for full-attention
+layers (left) and linear-attention layers (right).</figcaption>
+</figure>
+<h3 id="results-on-browsecomp-plus">Results on BrowseComp-Plus</h3>
+<p>We perform an end-to-end evaluation of SCR on BrowseComp-Plus with
+the <a
+href="https://github.com/facebookresearch/context-language-models/tree/main/clm/clm_harness">CLM
+harness</a>, by simply switching the Qwen3.6-27B endpoint from standard
+SGLang to our patched SGLang with SCR (Section 5.3 of the <a
+href="https://arxiv.org/abs/2609.37725">paper</a>).<span
+class="sidenote-wrapper"><label for="sn-4" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-4" class="margin-toggle"/><span
+class="sidenote">Our implementation of Suffix Cache Reuse is available
+at <a
+href="https://github.com/facebookresearch/context-language-models/tree/main/suffix_cache_reuse">facebookresearch/context-language-models/suffix_cache_reuse</a>.<br />
+<br />
+</span></span></p>
+<figure>
+<img src="/draft/assets/img/clm/scr-bcp830-results.png"
+alt="Suffix Cache Reuse on BrowseComp-Plus with a Qwen3.6-27B CLM. All 830 questions were served both ways. Left: task accuracy. Middle: compute per question, split into prefill and decode. Right: where the prompt tokens came from, over all turns and over the turns right after a context edit." />
+<figcaption aria-hidden="true">Suffix Cache Reuse on BrowseComp-Plus
+with a Qwen3.6-27B CLM. All 830 questions were served both ways. Left:
+task accuracy. Middle: compute per question, split into prefill and
+decode. Right: where the prompt tokens came from, over all turns and
+over the turns right after a context edit.</figcaption>
+</figure>
+<p>Accuracy is identical, 60.2% both ways, while compute drops from
+10.98 to 7.14 PFLOPs per question. On the turns right after an edit, SCR
+serves an extra 28.2% of the prompt from relocated cache that standard
+serving would have recomputed. CLMs were already cheaper than the
+baselines under standard serving, through better context management
+alone; SCR brings their serving cost down to 65% of that.</p>
+<p><strong>Bonus: reasoning-token stripping is a context edit
+too.</strong> Other cache misses arise from reasoning-token stripping in
+some chat-template serving. For models such as Qwen3.6, earlier
+reasoning blocks are removed from subsequent prompts, forcing the
+unchanged suffix to be prefilled again. SCR reuses this suffix cache as
+well. In fact, most of SCR’s extra reuse comes from stripped reasoning
+rather than CLM edits. The figure below shows a decomposition of the
+tokens hit by Suffix Cache Reuse.</p>
+<figure>
+<img src="/draft/assets/img/clm/scr-strip-savings.png"
+alt="Where Suffix Cache Reuse finds reusable cache on BrowseComp-Plus, over all turns and over the turns right after an edit. Qwen3.6-27B, 830 questions." />
+<figcaption aria-hidden="true">Where Suffix Cache Reuse finds reusable
+cache on BrowseComp-Plus, over all turns and over the turns right after
+an edit. Qwen3.6-27B, 830 questions.</figcaption>
+</figure>
+<p><strong>Improvement space for cache misses.</strong> We also looked
+at the unchanged tokens that are still prefilled with SCR. SCR removes
+most re-prefilling of unchanged suffixes after an edit. Much of the
+remaining overhead comes from unchanged prefixes that standard SGLang
+fails to reuse efficiently for hybrid models, because linear-attention
+states are cached only at request boundaries. This leaves substantial
+room for improvement: finer-grained recurrent-state checkpoints could
+increase cache hit rates for both standard prefix caching and SCR. More
+broadly, serving models with editable context opens many new systems
+research directions.</p>
+<figure>
+<img src="/draft/assets/img/clm/scr-prefill-split.png"
+alt="Remaining re-prefill under standard serving and under Suffix Cache Reuse on BrowseComp-Plus, split by why each token was prefilled. Same runs as above." />
+<figcaption aria-hidden="true">Remaining re-prefill under standard
+serving and under Suffix Cache Reuse on BrowseComp-Plus, split by why
+each token was prefilled. Same runs as above.</figcaption>
+</figure>
+<h2 id="related-work">Related work</h2>
+<p>With standard prefix caching, changing an early part of a prompt
+forces the serving system to recompute the KV states of everything that
+follows, even when the later text is unchanged. Prior work relaxes this
+requirement in different settings. <a
+href="https://arxiv.org/abs/2311.04934">Prompt Cache</a> precomputes
+attention states for predefined prompt modules, allowing a module to be
+reused in prompts that do not share the same preceding text. In
+retrieval-augmented generation, the same document may appear after
+different documents or instructions. <a
+href="https://arxiv.org/abs/2405.16444">CacheBlend</a> and <a
+href="https://arxiv.org/abs/2410.15332">EPIC</a> reuse cached document
+chunks in these new contexts, recomputing selected tokens to account for
+the changed surroundings.</p>
+<p><a href="https://arxiv.org/abs/2407.03157">PIE</a> studies cache
+reuse when a user modifies previously processed code and requests a new
+completion. It retains cached states for unchanged text after an edit
+and corrects their rotary positions, avoiding suffix recomputation. <a
+href="https://arxiv.org/abs/2604.09852">Memento</a> evicts each
+completed reasoning block from the KV cache but keeps the cached states
+of its summary, which were computed while the block was still in
+context, and finds that these states retain useful information from the
+evicted block. Concurrently, <a
+href="https://arxiv.org/abs/2609.35750">KV-streams</a>, released in the
+last few days, keeps the KV cache across agentic compaction during
+reinforcement learning instead of flushing it, and reports a 2× speed-up
+on SWE tasks with any compaction method. Suffix Cache Reuse applies the
+same reuse principle to an agent’s live context: when the agent replaces
+a span, the unchanged suffix retains its cached states rather than being
+prefilled again. We integrate this mechanism into SGLang for
+agent-driven context editing and further extend it to hybrid
+architectures that combine full-attention layers with linear-attention
+layers.</p>
+<p>We believe cache space can enable more context management
+opportunities than pure token space. We are excited to see more work
+along this line.</p>
+<h2 id="limitations">Limitations</h2>
+<p>Suffix Cache Reuse makes more approximations than prefix cache reuse.
+A reused prefix is exact, since its states depend only on tokens that
+have not changed. A relocated suffix is not. Its cached states were
+computed while the old span was still in context, so they may still
+reflect text the edit removed and miss text it added. The approximation
+is larger for hybrid models, whose linear-attention layers resume from a
+recurrent state taken before the edit and see the new span only through
+the full-attention layers. We cap the number of relocated spans per edit
+to limit this, and on BrowseComp-Plus SCR matches standard serving in
+accuracy. We have not yet characterized where these approximations break
+down. More work is needed to profile their failure cases and to make
+reuse adaptive, deciding for each edit what to reuse and what to
+recompute.</p>
+<h2 id="references">References</h2>
+<div class="references">
+<ol type="1">
+<li>Rulin Shao, Shannon Zejiang Shen, Junjie Oscar Yin, Yuetai Li,
+Minheng Wang, Hamish Ivison, Radha Poovendran, Nathan Lambert, Teng
+Xiao, Mike Lewis, Wen-tau Yih, Luke Zettlemoyer, and Pang Wei Koh. <a
+href="https://arxiv.org/abs/2609.37725">Context Language Models</a>.
+arXiv:2609.37725, 2026.</li>
+<li>Lianmin Zheng et al. <a
+href="https://arxiv.org/abs/2312.07104">SGLang: Efficient Execution of
+Structured Language Model Programs</a>. arXiv:2312.07104, 2023.</li>
+<li>Woosuk Kwon et al. <a
+href="https://arxiv.org/abs/2309.06180">Efficient Memory Management for
+Large Language Model Serving with PagedAttention</a> (vLLM). SOSP
+2023.</li>
+<li><a href="https://en.wikipedia.org/wiki/Radix_tree">Radix tree</a>.
+Wikipedia.</li>
+<li>In Gim et al. <a href="https://arxiv.org/abs/2311.04934">Prompt
+Cache: Modular Attention Reuse for Low-Latency Inference</a>.
+arXiv:2311.04934, 2023.</li>
+<li>Jiayi Yao et al. <a
+href="https://arxiv.org/abs/2405.16444">CacheBlend: Fast Large Language
+Model Serving for RAG with Cached Knowledge Fusion</a>.
+arXiv:2405.16444, 2024.</li>
+<li>Junhao Hu et al. <a href="https://arxiv.org/abs/2410.15332">EPIC:
+Efficient Position-Independent Caching for Serving Large Language
+Models</a>. arXiv:2410.15332, 2024.</li>
+<li>Zhenyu He et al. <a href="https://arxiv.org/abs/2407.03157">Let the
+Code LLM Edit Itself When You Edit the Code</a> (PIE). arXiv:2407.03157,
+2024.</li>
+<li>Vasilis Kontonis et al. <a
+href="https://arxiv.org/abs/2604.09852">MEMENTO: Teaching LLMs to Manage
+Their Own Context</a>. arXiv:2604.09852, 2026.</li>
+<li>Emiliano Penaloza et al. <a
+href="https://arxiv.org/abs/2609.35750">KV-streams for Efficient
+Compaction in Agentic Reinforcement Learning</a>. arXiv:2609.35750,
+2026.</li>
+</ol>
+</div>
+<h2 id="citation">Citation</h2>
+<div class="citation">
+<p>Please cite this work as:</p>
+<pre><code>@article{shao2026context,
+  title   = {Context Language Models},
+  author  = {Shao, Rulin and Shen, Shannon Zejiang and Yin, Junjie Oscar and
+             Li, Yuetai and Wang, Minheng and Ivison, Hamish and
+             Poovendran, Radha and Lambert, Nathan and Xiao, Teng and
+             Lewis, Mike and Yih, Wen-tau and Zettlemoyer, Luke and
+             Koh, Pang Wei},
+  journal = {arXiv preprint arXiv:2609.37725},
+  year    = {2026}
+}</code></pre>
+</div>
+<div class="draft-note">
+<p>Add the tweet link to the resources line once it is posted.</p>
+</div>
+
+  <p class="signoff"><a href="/draft/blog/">&larr; All posts</a></p>
+</main>
+
+<script>
+  (function () {
+    var article = document.querySelector('main');
+    var toc = document.getElementById('TOC');
+    if (!article || !toc) return;
+    var headings = article.querySelectorAll('h2, h3');
+    if (!headings.length) { toc.style.display = 'none'; return; }
+
+    var list = document.createElement('ul');
+    var currentTop = null;
+    var currentSub = null;
+
+    headings.forEach(function (h) {
+      if (!h.id) {
+        h.id = h.textContent.trim().toLowerCase().replace(/[^\w]+/g, '-');
+      }
+      var li = document.createElement('li');
+      var a = document.createElement('a');
+      a.href = '#' + h.id;
+      a.textContent = h.textContent;
+      li.appendChild(a);
+
+      if (h.tagName === 'H2') {
+        list.appendChild(li);
+        currentTop = li;
+        currentSub = null;
+      } else {
+        if (!currentSub) {
+          currentSub = document.createElement('ul');
+          (currentTop || list).appendChild(currentSub);
+        }
+        currentSub.appendChild(li);
+      }
+    });
+
+    toc.appendChild(list);
+  })();
+</script>
+<footer class="site-footer">
+  <div class="site-footer__inner">
+    <span>WAI &middot; University of Washington</span>
+    <span>&copy; 2026</span>
+  </div>
+</footer>
+
+</body>
+</html>

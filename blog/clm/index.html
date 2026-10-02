@@ -86,7 +86,7 @@ this one only show up in local builds; production builds hide them.</p>
 <p><strong>Resources:</strong> <a
 href="https://arxiv.org/abs/2609.37725">📄 Paper</a> · <a
 href="https://github.com/facebookresearch/context-language-models">👨‍💻
-GitHub</a> · <a href="#">🐦 Tweet</a></p>
+GitHub</a> · <a href="https://x.com/RulinShao/status/2105282444270448647">🐦 Tweet</a></p>
 <p>We recently introduced Context Language Models (CLMs),<span
 class="sidenote-wrapper"><label for="sn-0" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn-0" class="margin-toggle"/><span
 class="sidenote">Rulin Shao, Shannon Zejiang Shen, Junjie Oscar Yin,
@@ -197,9 +197,7 @@ edit. The rest of an edited turn is prefilled again, including the large
 part of the context that the edit left unchanged.</p>
 <h2 id="suffix-cache-reuse">Suffix Cache Reuse</h2>
 <p>Prefix cache reuse has been the tradition in serving engines because
-context has always been append-only. But we ask: <strong>can we adapt
-serving engines for AI’s convenience</strong>, especially given the
-trend toward recursive self-improvement (RSI)? To that end, we propose a
+context has always been append-only. But we ask: <strong>can we adapt serving engines for AI’s convenience?</strong> To that end, we propose a
 simple yet effective method, Suffix Cache Reuse, to make CLM serving
 even more efficient on the system side.</p>
 <div class="tok-viz tok-viz-fig">

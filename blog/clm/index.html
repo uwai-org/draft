@@ -293,6 +293,10 @@ set and what effect it has, are in Appendix B of the paper; the main
 text uses k = 6.<br />
 <br />
 </span></span></p>
+<figure>
+<img src="/draft/assets/img/clm/scr-rope-rotation.svg" alt="How Suffix Cache Reuse relocates the cached entries of C: the new prompt is diffed against the cached one, every surviving token of C moves by Δ positions, and for each of its cached entries the key is rotated by Δ while the value is copied." />
+<figcaption aria-hidden="true">How Suffix Cache Reuse relocates the cached entries of C: the new prompt is diffed against the cached one, every surviving token of C moves by Δ positions, and for each of its cached entries the key is rotated by Δ while the value is copied.</figcaption>
+</figure>
 <p>Qwen3.6-27B is a hybrid model: 48 of its 64 layers use linear
 attention, which keeps a fixed-size recurrent state rather than a
 per-token cache, so there are no per-token entries to move. For those
